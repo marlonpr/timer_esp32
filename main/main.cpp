@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <string_view>
 
@@ -265,12 +266,41 @@ void SendAck(int socket_fd, const sockaddr_in &peer,
     SendPacket(socket_fd, peer, packet, length, "ACK");
 }
 
+struct WifiDiagnostics {
+    int rssi_dbm{-127};
+    uint8_t channel{};
+    char bssid[18]{"00:00:00:00:00:00"};
+};
+
+WifiDiagnostics ReadWifiDiagnostics() {
+    WifiDiagnostics diagnostics{};
+    wifi_ap_record_t ap{};
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+        return diagnostics;
+    }
+
+    diagnostics.rssi_dbm = static_cast<int>(ap.rssi);
+    diagnostics.channel = ap.primary;
+    std::snprintf(
+        diagnostics.bssid, sizeof(diagnostics.bssid),
+        "%02X:%02X:%02X:%02X:%02X:%02X",
+        static_cast<unsigned>(ap.bssid[0]),
+        static_cast<unsigned>(ap.bssid[1]),
+        static_cast<unsigned>(ap.bssid[2]),
+        static_cast<unsigned>(ap.bssid[3]),
+        static_cast<unsigned>(ap.bssid[4]),
+        static_cast<unsigned>(ap.bssid[5]));
+    return diagnostics;
+}
+
 void SendStatus(int socket_fd, const sockaddr_in &peer,
                 const factory_timer::TimerSnapshot &snapshot) {
+    const WifiDiagnostics diagnostics = ReadWifiDiagnostics();
     char packet[factory_timer::kMaxPacketLength + 1]{};
     const int length = factory_timer::FormatStatus(
         packet, sizeof(packet), CONFIG_FACTORY_DEVICE_ID,
-        snapshot.last_command_id, snapshot.state, snapshot.remaining_seconds);
+        snapshot.last_command_id, snapshot.state, snapshot.remaining_seconds,
+        diagnostics.rssi_dbm, diagnostics.channel, diagnostics.bssid);
     SendPacket(socket_fd, peer, packet, length, "STATUS");
 }
 

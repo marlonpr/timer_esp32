@@ -130,7 +130,14 @@ void CheckProtocolFormats() {
     CHECK(master.sync_set.best_rtt_us == 4200);
 
     char packet[factory_timer::kMaxPacketLength + 1]{};
-    int length = factory_timer::FormatSyncReply(
+    int length = factory_timer::FormatStatus(
+        packet, sizeof(packet), "ESP03", 0x0123456789abcdefULL,
+        factory_timer::TimerState::Running, 19, -57, 6, "AA:BB:CC:DD:EE:FF");
+    CHECK(length > 0);
+    CHECK(std::string_view(packet, static_cast<std::size_t>(length)) ==
+          "FCT2|STATUS|ESP03|0123456789ABCDEF|RUNNING|19|-57|6|AA:BB:CC:DD:EE:FF");
+
+    length = factory_timer::FormatSyncReply(
         packet, sizeof(packet), "ESP02", 0x0123456789abcdefULL,
         100000, 40000, 40005);
     CHECK(length > 0);

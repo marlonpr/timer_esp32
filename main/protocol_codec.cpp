@@ -298,12 +298,17 @@ int FormatAck(char* destination, std::size_t capacity, std::string_view device_i
 }
 
 int FormatStatus(char* destination, std::size_t capacity, std::string_view device_id,
-                 uint64_t command_id, TimerState state, uint32_t remaining_seconds) {
-    if (destination == nullptr || capacity == 0 || !ValidDeviceId(device_id)) return -1;
-    return std::snprintf(destination, capacity, "FCT1|STATUS|%.*s|%016llX|%s|%u",
+                 uint64_t command_id, TimerState state, uint32_t remaining_seconds,
+                 int rssi_dbm, uint8_t wifi_channel, std::string_view bssid) {
+    if (destination == nullptr || capacity == 0 || !ValidDeviceId(device_id) ||
+        bssid.size() != 17) return -1;
+    return std::snprintf(destination, capacity,
+                         "FCT2|STATUS|%.*s|%016llX|%s|%u|%d|%u|%.*s",
                          static_cast<int>(device_id.size()), device_id.data(),
                          static_cast<unsigned long long>(command_id), TimerStateName(state),
-                         static_cast<unsigned>(remaining_seconds));
+                         static_cast<unsigned>(remaining_seconds), rssi_dbm,
+                         static_cast<unsigned>(wifi_channel),
+                         static_cast<int>(bssid.size()), bssid.data());
 }
 
 int FormatSyncReply(char* destination, std::size_t capacity, std::string_view device_id,

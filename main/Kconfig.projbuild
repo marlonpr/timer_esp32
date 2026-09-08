@@ -1,0 +1,29 @@
+menu "Factory timer configuration"
+
+config FACTORY_WIFI_SSID
+    string "Wi-Fi SSID"
+    default ""
+    help
+        SSID used by this timer in Wi-Fi station mode.
+
+config FACTORY_WIFI_PASSWORD
+    string "Wi-Fi password"
+    default ""
+    help
+        WPA/WPA2/WPA3 password. Leave empty only for an open test network.
+
+config FACTORY_DEVICE_ID
+    string "Timer device ID"
+    default "ESP01"
+    help
+        Uppercase protocol identifier. For the fleet test use ESP01 through ESP05.
+        The protocol supports extending the same naming convention through ESP15.
+
+config FACTORY_DEBUG_LOGS
+    bool "Enable verbose factory timer protocol logs"
+    default n
+    help
+        Compile detailed FCT1 packet, peer, acknowledgement, duplicate, and
+        heartbeat logging into the firmware. Leave disabled for normal use.
+
+endmenu

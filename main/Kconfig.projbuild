@@ -26,4 +26,20 @@ config FACTORY_DEBUG_LOGS
         Compile detailed FCT1 packet, peer, acknowledgement, duplicate, and
         heartbeat logging into the firmware. Leave disabled for normal use.
 
+config FACTORY_START_EDGE_DIAGNOSTICS
+    bool "Enable physical START-edge diagnostic GPIO"
+    default y
+    help
+        Drives a GPIO high at the real scheduler START transition and low when
+        the timer is re-armed/reset. Use only for timing validation.
+
+config FACTORY_START_EDGE_GPIO
+    int "Physical START-edge diagnostic GPIO"
+    range 0 48
+    default 21
+    depends on FACTORY_START_EDGE_DIAGNOSTICS
+    help
+        GPIO connected to the external/ESP32 logic analyzer. GPIO21 is safe
+        for the current timer-only ESP32 and ESP32-S3 test firmware.
+
 endmenu

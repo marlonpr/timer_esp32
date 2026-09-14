@@ -313,15 +313,31 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
 
 int FormatSyncReply(char* destination, std::size_t capacity, std::string_view device_id,
                     uint64_t sync_id, int64_t master_t1_us,
-                    int64_t local_t2_us, int64_t local_t3_us) {
+                    int64_t local_t2_us, int64_t local_t3_us,
+                    uint32_t actual_artificial_reply_delay_us) {
     if (destination == nullptr || capacity == 0 || !ValidDeviceId(device_id) || sync_id == 0) return -1;
+
+    // Preserve the original seven-field packet for normal operation so older
+    // controller builds remain compatible. The eighth field is emitted only
+    // when an experimental reverse-path delay is active.
+    if (actual_artificial_reply_delay_us == 0) {
+        return std::snprintf(destination, capacity,
+                             "FCT2|SYNC_REPLY|%.*s|%016llX|%lld|%lld|%lld",
+                             static_cast<int>(device_id.size()), device_id.data(),
+                             static_cast<unsigned long long>(sync_id),
+                             static_cast<long long>(master_t1_us),
+                             static_cast<long long>(local_t2_us),
+                             static_cast<long long>(local_t3_us));
+    }
+
     return std::snprintf(destination, capacity,
-                         "FCT2|SYNC_REPLY|%.*s|%016llX|%lld|%lld|%lld",
+                         "FCT2|SYNC_REPLY|%.*s|%016llX|%lld|%lld|%lld|%u",
                          static_cast<int>(device_id.size()), device_id.data(),
                          static_cast<unsigned long long>(sync_id),
                          static_cast<long long>(master_t1_us),
                          static_cast<long long>(local_t2_us),
-                         static_cast<long long>(local_t3_us));
+                         static_cast<long long>(local_t3_us),
+                         static_cast<unsigned>(actual_artificial_reply_delay_us));
 }
 
 int FormatSyncApplied(char* destination, std::size_t capacity, std::string_view device_id,

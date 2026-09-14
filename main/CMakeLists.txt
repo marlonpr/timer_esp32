@@ -6,7 +6,7 @@ idf_component_register(
         "protocol_codec.cpp"
         "network_policy.cpp"
     INCLUDE_DIRS "."
-    REQUIRES esp_event esp_netif esp_timer esp_wifi nvs_flash lwip
+    REQUIRES esp_driver_gpio esp_event esp_netif esp_timer esp_wifi nvs_flash lwip
 )
 
 target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_17)

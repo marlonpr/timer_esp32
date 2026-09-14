@@ -9,6 +9,7 @@
 #include <cstring>
 #include <string_view>
 
+#include "driver/gpio.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -36,6 +37,7 @@ constexpr uint32_t kRejectedNetworkRetryDelayMs = 1000;
 constexpr UBaseType_t kTimerTaskPriority = 24;
 constexpr int64_t kSchedulerFineLeadUs = 2000;
 constexpr int64_t kFreeRtosTickUs = 1000000LL / configTICK_RATE_HZ;
+constexpr int64_t kExperimentalDelayFineLeadUs = 2000;
 
 EventGroupHandle_t wifi_event_group;
 esp_netif_t *wifi_sta_netif = nullptr;
@@ -304,29 +306,97 @@ void SendStatus(int socket_fd, const sockaddr_in &peer,
     SendPacket(socket_fd, peer, packet, length, "STATUS");
 }
 
+#if defined(CONFIG_FACTORY_START_EDGE_DIAGNOSTICS) && CONFIG_FACTORY_START_EDGE_DIAGNOSTICS
+void SetStartDiagnosticEdge(bool high) {
+    gpio_set_level(static_cast<gpio_num_t>(CONFIG_FACTORY_START_EDGE_GPIO), high ? 1 : 0);
+}
+#else
+void SetStartDiagnosticEdge(bool) {}
+#endif
+
+uint32_t WaitExperimentalReplyDelayUs(uint32_t requested_delay_us) {
+    if (requested_delay_us == 0) return 0;
+
+    const int64_t start_us = esp_timer_get_time();
+    if (requested_delay_us > static_cast<uint32_t>(kExperimentalDelayFineLeadUs + kFreeRtosTickUs)) {
+        // Sleep most of a long diagnostic delay so the command task does not
+        // busy-spin for hundreds of milliseconds. Stop at least ~2 ms early,
+        // then use esp_timer_get_time() for the precision tail. Any scheduling
+        // overshoot is measured and reported to the controller.
+        const int64_t coarse_budget_us =
+            static_cast<int64_t>(requested_delay_us) - kExperimentalDelayFineLeadUs;
+        const TickType_t coarse_ticks = static_cast<TickType_t>(coarse_budget_us / kFreeRtosTickUs);
+        if (coarse_ticks > 0) {
+            vTaskDelay(coarse_ticks);
+        }
+    }
+
+    while ((esp_timer_get_time() - start_us) < requested_delay_us) {
+        // Experimental microsecond reverse-path delay. CommandTask priority is
+        // intentionally lower than Wi-Fi/LWIP system work, so occasional
+        // preemption appears as positive overshoot and is logged, not hidden.
+    }
+
+    const int64_t actual_us = esp_timer_get_time() - start_us;
+    if (actual_us <= 0) return 0;
+    if (actual_us > UINT32_MAX) return UINT32_MAX;
+    return static_cast<uint32_t>(actual_us);
+}
+
 void SendSyncReply(int socket_fd, const sockaddr_in &peer,
                    const factory_timer::SyncRequestPacket &request,
                    int64_t local_t2_us) {
     // t3 is intentionally captured BEFORE the optional test delay. This makes
-    // the delay appear in (t4 - t3), exactly like reverse-path network latency.
+    // all firmware-side hold time after t3 appear in (t4 - t3), exactly like
+    // reverse-path network latency.
     const int64_t local_t3_us = esp_timer_get_time();
-    char packet[factory_timer::kMaxPacketLength + 1]{};
-    const int length = factory_timer::FormatSyncReply(
-        packet, sizeof(packet), CONFIG_FACTORY_DEVICE_ID, request.sync_id,
-        request.master_t1_us, local_t2_us, local_t3_us);
+    const uint32_t busy_wait_us =
+        WaitExperimentalReplyDelayUs(request.artificial_reply_delay_us);
 
+    char packet[factory_timer::kMaxPacketLength + 1]{};
+
+    // First format pass is intentional for experimental delayed replies: it
+    // lets ActualReverseDelayUs include the normal packet-formatting work that
+    // occurs after t3. A second final format inserts that measured hold value.
+    // The final format/send interval is necessarily not self-reportable inside
+    // the packet itself; the host-side CAL-vs-VER reverse-path check detects
+    // any residual/unreported hold outside this measurement.
+    int length = factory_timer::FormatSyncReply(
+        packet, sizeof(packet), CONFIG_FACTORY_DEVICE_ID, request.sync_id,
+        request.master_t1_us, local_t2_us, local_t3_us, busy_wait_us);
+
+    uint32_t reported_hold_us = busy_wait_us;
     if (request.artificial_reply_delay_us > 0) {
-        const uint32_t delay_ms =
-            (request.artificial_reply_delay_us + 999U) / 1000U;
-        ESP_LOGI(kTag,
-                 "SYNC experiment reverse-path delay: sync=%016llX delay_us=%u t3_local_us=%lld",
-                 static_cast<unsigned long long>(request.sync_id),
-                 static_cast<unsigned>(request.artificial_reply_delay_us),
-                 static_cast<long long>(local_t3_us));
-        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        const int64_t held_us_64 = esp_timer_get_time() - local_t3_us;
+        if (held_us_64 <= 0) {
+            reported_hold_us = 0;
+        } else if (held_us_64 > UINT32_MAX) {
+            reported_hold_us = UINT32_MAX;
+        } else {
+            reported_hold_us = static_cast<uint32_t>(held_us_64);
+        }
+
+        length = factory_timer::FormatSyncReply(
+            packet, sizeof(packet), CONFIG_FACTORY_DEVICE_ID, request.sync_id,
+            request.master_t1_us, local_t2_us, local_t3_us, reported_hold_us);
     }
 
-    SendPacket(socket_fd, peer, packet, length, "SYNC_REPLY");
+    // Nothing that can block belongs between the final packet construction and
+    // SendPacket(). In particular, UART logging here would silently inflate the
+    // reverse path. Keep the diagnostic AFTER sendto() has accepted the packet.
+    const bool sent = SendPacket(socket_fd, peer, packet, length, "SYNC_REPLY");
+
+    if (request.artificial_reply_delay_us > 0) {
+        ESP_LOGI(kTag,
+                 "SYNC experiment reverse-path delay: sync=%016llX requested_us=%u busy_wait_us=%u reported_hold_us=%u overshoot_us=%d sent=%d t3_local_us=%lld",
+                 static_cast<unsigned long long>(request.sync_id),
+                 static_cast<unsigned>(request.artificial_reply_delay_us),
+                 static_cast<unsigned>(busy_wait_us),
+                 static_cast<unsigned>(reported_hold_us),
+                 static_cast<int>(reported_hold_us) - static_cast<int>(request.artificial_reply_delay_us),
+                 sent ? 1 : 0,
+                 static_cast<long long>(local_t3_us));
+    }
 }
 
 void SendSyncApplied(int socket_fd, const sockaddr_in &peer,
@@ -359,6 +429,9 @@ void StopStartTimerLocked() {
 }
 
 void ArmStartTimerLocked(int64_t local_start_us) {
+    // Ensure every armed command produces a fresh rising edge even if a prior
+    // diagnostic trial did not complete its normal RESET cleanup.
+    SetStartDiagnosticEdge(false);
     const int64_t arm_local_us = esp_timer_get_time();
     const int64_t delay_us = local_start_us - arm_local_us;
 
@@ -457,6 +530,11 @@ void TimerTask(void *) {
                     }
                 }
 
+                // Physical validation point: the output transition is emitted
+                // from the same high-priority task that owns Armed -> Running.
+                // gpio_set_level latency is sub-microsecond-scale relative to
+                // the 100+ us effects being measured and can be calibrated.
+                SetStartDiagnosticEdge(true);
                 scheduled_start_metadata.valid = false;
                 started = true;
             }
@@ -488,6 +566,19 @@ void TimerTask(void *) {
 }
 
 void InitialiseStartScheduler() {
+#if defined(CONFIG_FACTORY_START_EDGE_DIAGNOSTICS) && CONFIG_FACTORY_START_EDGE_DIAGNOSTICS
+    gpio_config_t diagnostic_gpio{};
+    diagnostic_gpio.pin_bit_mask = 1ULL << CONFIG_FACTORY_START_EDGE_GPIO;
+    diagnostic_gpio.mode = GPIO_MODE_OUTPUT;
+    diagnostic_gpio.pull_up_en = GPIO_PULLUP_DISABLE;
+    diagnostic_gpio.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    diagnostic_gpio.intr_type = GPIO_INTR_DISABLE;
+    ESP_ERROR_CHECK(gpio_config(&diagnostic_gpio));
+    SetStartDiagnosticEdge(false);
+    ESP_LOGI(kTag, "Physical START-edge diagnostic enabled on GPIO%d",
+             CONFIG_FACTORY_START_EDGE_GPIO);
+#endif
+
     countdown_mutex = xSemaphoreCreateMutex();
     if (countdown_mutex == nullptr) {
         ESP_LOGE(kTag, "Could not create countdown mutex");
@@ -674,6 +765,7 @@ void CommandTask(void *) {
                                         : 0;
                                 ArmStartTimerLocked(countdown.ScheduledStartMicroseconds());
                             } else if (command.type == factory_timer::CommandType::Reset) {
+                                SetStartDiagnosticEdge(false);
                                 // STATUS_REQUEST is intentionally non-mutating. The controller
                                 // sends status requests while a countdown is ARMED, and clearing
                                 // the metadata here would discard the peer/offset required for

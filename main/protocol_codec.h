@@ -79,7 +79,8 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
                  int rssi_dbm, uint8_t wifi_channel, std::string_view bssid);
 int FormatSyncReply(char* destination, std::size_t capacity, std::string_view device_id,
                     uint64_t sync_id, int64_t master_t1_us,
-                    int64_t local_t2_us, int64_t local_t3_us);
+                    int64_t local_t2_us, int64_t local_t3_us,
+                    uint32_t actual_artificial_reply_delay_us = 0);
 int FormatSyncApplied(char* destination, std::size_t capacity, std::string_view device_id,
                       uint64_t sync_id, int64_t master_minus_local_offset_us,
                       uint64_t best_rtt_us);

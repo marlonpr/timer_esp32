@@ -1,15 +1,20 @@
 #include "command_processor.h"
 #include "factory_log.h"
+#include "factory_display.h"
 #include "network_policy.h"
 #include "protocol_codec.h"
 
 #include <atomic>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string_view>
 
 #include "driver/gpio.h"
+#if CONFIG_IDF_TARGET_ESP32S3
+#include "driver/temperature_sensor.h"
+#endif
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -35,6 +40,8 @@ constexpr int64_t kHeartbeatIntervalUs = 2000000;
 constexpr int64_t kCommandSocketTimeoutUs = 50000;
 constexpr uint32_t kRejectedNetworkRetryDelayMs = 1000;
 constexpr UBaseType_t kTimerTaskPriority = 24;
+constexpr UBaseType_t kCommandTaskPriority = 15;
+constexpr BaseType_t kControlTaskCore = 0;
 constexpr int64_t kSchedulerFineLeadUs = 2000;
 constexpr int64_t kFreeRtosTickUs = 1000000LL / configTICK_RATE_HZ;
 constexpr int64_t kExperimentalDelayFineLeadUs = 2000;
@@ -48,6 +55,11 @@ factory_timer::CountdownTimer countdown;
 SemaphoreHandle_t countdown_mutex = nullptr;
 QueueHandle_t timer_event_queue = nullptr;
 TaskHandle_t timer_task_handle = nullptr;
+
+#if CONFIG_IDF_TARGET_ESP32S3
+temperature_sensor_handle_t die_temperature_sensor = nullptr;
+bool die_temperature_sensor_ready = false;
+#endif
 
 struct ClockSyncState {
     std::atomic<bool> valid{false};
@@ -343,9 +355,68 @@ uint32_t WaitExperimentalReplyDelayUs(uint32_t requested_delay_us) {
     return static_cast<uint32_t>(actual_us);
 }
 
+void InitialiseDieTemperatureSensor() {
+#if CONFIG_IDF_TARGET_ESP32S3
+    // BG-1 uses die temperature only as a covariate for clock-rate analysis.
+    // The timer remains fully functional if TSENS installation is unavailable.
+    temperature_sensor_config_t config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 50);
+    const esp_err_t install_result =
+        temperature_sensor_install(&config, &die_temperature_sensor);
+    if (install_result != ESP_OK) {
+        ESP_LOGW(kTag, "Die-temperature sensor unavailable: install failed (%s)",
+                 esp_err_to_name(install_result));
+        die_temperature_sensor = nullptr;
+        return;
+    }
+
+    const esp_err_t enable_result = temperature_sensor_enable(die_temperature_sensor);
+    if (enable_result != ESP_OK) {
+        ESP_LOGW(kTag, "Die-temperature sensor unavailable: enable failed (%s)",
+                 esp_err_to_name(enable_result));
+        temperature_sensor_uninstall(die_temperature_sensor);
+        die_temperature_sensor = nullptr;
+        return;
+    }
+
+    die_temperature_sensor_ready = true;
+    ESP_LOGI(kTag, "BG-1 die-temperature telemetry enabled");
+#else
+    ESP_LOGI(kTag, "BG-1 die-temperature telemetry unavailable on this target");
+#endif
+}
+
+bool ReadDieTemperatureMilliCelsius(int32_t &temperature_milli_c) {
+#if CONFIG_IDF_TARGET_ESP32S3
+    if (!die_temperature_sensor_ready || die_temperature_sensor == nullptr) {
+        return false;
+    }
+
+    float celsius = 0.0f;
+    if (temperature_sensor_get_celsius(die_temperature_sensor, &celsius) != ESP_OK ||
+        !std::isfinite(celsius)) {
+        return false;
+    }
+
+    temperature_milli_c = static_cast<int32_t>(std::lround(celsius * 1000.0f));
+    return true;
+#else
+    (void)temperature_milli_c;
+    return false;
+#endif
+}
+
 void SendSyncReply(int socket_fd, const sockaddr_in &peer,
                    const factory_timer::SyncRequestPacket &request,
                    int64_t local_t2_us) {
+    // Temperature telemetry is BG-1 opt-in. Read it before t3 so conversion time
+    // is inside the device-processing interval (t3-t2) and therefore cancels
+    // from the NTP-style network RTT. Foreground timing/control packets do not
+    // request it and keep their established timing/packet shape.
+    int32_t die_temperature_milli_c = 0;
+    const bool have_die_temperature =
+        request.request_die_temperature &&
+        ReadDieTemperatureMilliCelsius(die_temperature_milli_c);
+
     // t3 is intentionally captured BEFORE the optional test delay. This makes
     // all firmware-side hold time after t3 appear in (t4 - t3), exactly like
     // reverse-path network latency.
@@ -363,7 +434,8 @@ void SendSyncReply(int socket_fd, const sockaddr_in &peer,
     // any residual/unreported hold outside this measurement.
     int length = factory_timer::FormatSyncReply(
         packet, sizeof(packet), CONFIG_FACTORY_DEVICE_ID, request.sync_id,
-        request.master_t1_us, local_t2_us, local_t3_us, busy_wait_us);
+        request.master_t1_us, local_t2_us, local_t3_us, busy_wait_us,
+        have_die_temperature, die_temperature_milli_c);
 
     uint32_t reported_hold_us = busy_wait_us;
     if (request.artificial_reply_delay_us > 0) {
@@ -378,7 +450,8 @@ void SendSyncReply(int socket_fd, const sockaddr_in &peer,
 
         length = factory_timer::FormatSyncReply(
             packet, sizeof(packet), CONFIG_FACTORY_DEVICE_ID, request.sync_id,
-            request.master_t1_us, local_t2_us, local_t3_us, reported_hold_us);
+            request.master_t1_us, local_t2_us, local_t3_us, reported_hold_us,
+            have_die_temperature, die_temperature_milli_c);
     }
 
     // Nothing that can block belongs between the final packet construction and
@@ -591,16 +664,18 @@ void InitialiseStartScheduler() {
         ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
     }
 
-    if (xTaskCreate(&TimerTask, "countdown_timer", 4096, nullptr,
-                    kTimerTaskPriority, &timer_task_handle) != pdPASS) {
+    if (xTaskCreatePinnedToCore(&TimerTask, "countdown_timer", 4096, nullptr,
+                                kTimerTaskPriority, &timer_task_handle,
+                                kControlTaskCore) != pdPASS) {
         ESP_LOGE(kTag, "Could not create countdown timer task");
         ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
     }
 
     ESP_LOGI(kTag,
-             "High-resolution countdown scheduler ready; source=deadline_task final_spin<=~%lld us timer_task_priority=%u UDP receive timeout=%lld us",
+             "High-resolution countdown scheduler ready; source=deadline_task final_spin<=~%lld us timer_task_priority=%u control_core=%d UDP receive timeout=%lld us",
              static_cast<long long>(kFreeRtosTickUs + kSchedulerFineLeadUs),
              static_cast<unsigned>(kTimerTaskPriority),
+             static_cast<int>(kControlTaskCore),
              static_cast<long long>(kCommandSocketTimeoutUs));
 }
 
@@ -764,8 +839,15 @@ void CommandTask(void *) {
                                         ? clock_sync.master_minus_local_offset_us
                                         : 0;
                                 ArmStartTimerLocked(countdown.ScheduledStartMicroseconds());
+#if defined(CONFIG_FACTORY_DISPLAY_TEST) && CONFIG_FACTORY_DISPLAY_TEST
+                                factory_display_arm(countdown.ScheduledStartMicroseconds(),
+                                                    processing.snapshot.duration_seconds);
+#endif
                             } else if (command.type == factory_timer::CommandType::Reset) {
                                 SetStartDiagnosticEdge(false);
+#if defined(CONFIG_FACTORY_DISPLAY_TEST) && CONFIG_FACTORY_DISPLAY_TEST
+                                factory_display_reset();
+#endif
                                 // STATUS_REQUEST is intentionally non-mutating. The controller
                                 // sends status requests while a countdown is ARMED, and clearing
                                 // the metadata here would discard the peer/offset required for
@@ -857,7 +939,26 @@ extern "C" void app_main() {
     ESP_LOGI(kTag, "Factory countdown timer starting");
     ESP_LOGI(kTag, "Configured device identity: %s", CONFIG_FACTORY_DEVICE_ID);
     InitialiseNvs();
+    InitialiseDieTemperatureSensor();
+#if defined(CONFIG_FACTORY_DISPLAY_TEST) && CONFIG_FACTORY_DISPLAY_TEST
+    if (!factory_display_init(CONFIG_FACTORY_DEVICE_ID,
+                              static_cast<uint8_t>(CONFIG_FACTORY_DISPLAY_BRIGHTNESS))) {
+        ESP_LOGE(kTag, "Countdown display initialization failed");
+        return;
+    }
+#endif
     InitialiseStartScheduler();
     InitialiseWifi();
-    xTaskCreate(&CommandTask, "udp_command", 7168, nullptr, 5, nullptr);
+    if (xTaskCreatePinnedToCore(&CommandTask, "udp_command", 7168, nullptr,
+                                kCommandTaskPriority, nullptr,
+                                kControlTaskCore) != pdPASS) {
+        ESP_LOGE(kTag, "Could not create UDP command task");
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    }
+    ESP_LOGI(kTag,
+             "Control-task placement: CommandTask priority=%u core=%d; TimerTask priority=%u core=%d",
+             static_cast<unsigned>(kCommandTaskPriority),
+             static_cast<int>(kControlTaskCore),
+             static_cast<unsigned>(kTimerTaskPriority),
+             static_cast<int>(kControlTaskCore));
 }

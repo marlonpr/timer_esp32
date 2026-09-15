@@ -150,31 +150,47 @@ bool ParseMasterPacket(std::string_view packet, MasterPacket& output, ParseError
     }
 
     if (packet.rfind("FCT2|SYNC|", 0) == 0) {
-        // Backward compatible forms:
+        // Backward-compatible forms:
         //   FCT2|SYNC|<id>|<t1>
         //   FCT2|SYNC|<id>|<t1>|<artificial_reply_delay_us>
+        // BG-1 shadow telemetry form:
+        //   FCT2|SYNC|<id>|<t1>|<artificial_reply_delay_us>|TEMP
         // The optional reply delay is used only by the controlled path-delay
-        // experiment. t3 is captured before that delay so NTP-style math sees
-        // it as reverse-path delay rather than device processing time.
+        // experiment. TEMP is opt-in so normal production/control packets keep
+        // their established byte-for-byte format and timing.
         std::string_view id_field;
         std::string_view t1_field;
         std::string_view delay_field;
         bool has_delay = false;
+        bool request_die_temperature = false;
 
-        std::array<std::string_view, 5> fields5{};
-        if (SplitExact(packet, fields5)) {
-            id_field = fields5[2];
-            t1_field = fields5[3];
-            delay_field = fields5[4];
-            has_delay = true;
-        } else {
-            std::array<std::string_view, 4> fields4{};
-            if (!SplitExact(packet, fields4)) {
+        std::array<std::string_view, 6> fields6{};
+        if (SplitExact(packet, fields6)) {
+            if (fields6[5] != "TEMP") {
                 error = ParseError::FieldCount;
                 return false;
             }
-            id_field = fields4[2];
-            t1_field = fields4[3];
+            id_field = fields6[2];
+            t1_field = fields6[3];
+            delay_field = fields6[4];
+            has_delay = true;
+            request_die_temperature = true;
+        } else {
+            std::array<std::string_view, 5> fields5{};
+            if (SplitExact(packet, fields5)) {
+                id_field = fields5[2];
+                t1_field = fields5[3];
+                delay_field = fields5[4];
+                has_delay = true;
+            } else {
+                std::array<std::string_view, 4> fields4{};
+                if (!SplitExact(packet, fields4)) {
+                    error = ParseError::FieldCount;
+                    return false;
+                }
+                id_field = fields4[2];
+                t1_field = fields4[3];
+            }
         }
 
         uint64_t sync_id = 0;
@@ -196,7 +212,8 @@ bool ParseMasterPacket(std::string_view packet, MasterPacket& output, ParseError
         }
         output = {};
         output.type = MasterPacketType::SyncRequest;
-        output.sync_request = SyncRequestPacket{sync_id, t1, artificial_reply_delay_us};
+        output.sync_request = SyncRequestPacket{
+            sync_id, t1, artificial_reply_delay_us, request_die_temperature};
         return true;
     }
 
@@ -314,12 +331,27 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
 int FormatSyncReply(char* destination, std::size_t capacity, std::string_view device_id,
                     uint64_t sync_id, int64_t master_t1_us,
                     int64_t local_t2_us, int64_t local_t3_us,
-                    uint32_t actual_artificial_reply_delay_us) {
+                    uint32_t actual_artificial_reply_delay_us,
+                    bool has_die_temperature,
+                    int32_t die_temperature_milli_c) {
     if (destination == nullptr || capacity == 0 || !ValidDeviceId(device_id) || sync_id == 0) return -1;
 
-    // Preserve the original seven-field packet for normal operation so older
-    // controller builds remain compatible. The eighth field is emitted only
-    // when an experimental reverse-path delay is active.
+    // Preserve the original seven/eight-field forms when die temperature is
+    // unavailable. BG-1 adds a ninth field only on targets where the supported
+    // ESP-IDF temperature-sensor driver is active. Field 8 remains the v9.2
+    // reverse-hold measurement, including zero for ordinary shadow samples.
+    if (has_die_temperature) {
+        return std::snprintf(destination, capacity,
+                             "FCT2|SYNC_REPLY|%.*s|%016llX|%lld|%lld|%lld|%u|%ld",
+                             static_cast<int>(device_id.size()), device_id.data(),
+                             static_cast<unsigned long long>(sync_id),
+                             static_cast<long long>(master_t1_us),
+                             static_cast<long long>(local_t2_us),
+                             static_cast<long long>(local_t3_us),
+                             static_cast<unsigned>(actual_artificial_reply_delay_us),
+                             static_cast<long>(die_temperature_milli_c));
+    }
+
     if (actual_artificial_reply_delay_us == 0) {
         return std::snprintf(destination, capacity,
                              "FCT2|SYNC_REPLY|%.*s|%016llX|%lld|%lld|%lld",

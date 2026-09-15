@@ -51,6 +51,7 @@ struct SyncRequestPacket {
     uint64_t sync_id{};
     int64_t master_t1_us{};
     uint32_t artificial_reply_delay_us{};
+    bool request_die_temperature{};
 };
 
 struct SyncSetPacket {
@@ -80,7 +81,9 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
 int FormatSyncReply(char* destination, std::size_t capacity, std::string_view device_id,
                     uint64_t sync_id, int64_t master_t1_us,
                     int64_t local_t2_us, int64_t local_t3_us,
-                    uint32_t actual_artificial_reply_delay_us = 0);
+                    uint32_t actual_artificial_reply_delay_us = 0,
+                    bool has_die_temperature = false,
+                    int32_t die_temperature_milli_c = 0);
 int FormatSyncApplied(char* destination, std::size_t capacity, std::string_view device_id,
                       uint64_t sync_id, int64_t master_minus_local_offset_us,
                       uint64_t best_rtt_us);

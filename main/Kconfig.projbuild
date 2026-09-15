@@ -43,3 +43,23 @@ config FACTORY_START_EDGE_GPIO
         for the current timer-only ESP32 and ESP32-S3 test firmware.
 
 endmenu
+
+menu "Factory HUB75 countdown display"
+
+config FACTORY_DISPLAY_TEST
+    bool "Enable 64x32 HUB75 visual countdown test"
+    default y
+    help
+        Enables one 64x32 P5 panel per timer. The panel shows the device number
+        while idle, changes to the countdown exactly at the local START deadline,
+        decrements once per second, and shows red 00 when finished.
+
+config FACTORY_DISPLAY_BRIGHTNESS
+    int "Countdown display brightness (0-255)"
+    range 1 255
+    default 128
+    depends on FACTORY_DISPLAY_TEST
+    help
+        S3 uses this value directly. Classic ESP32 maps it to 1-100 percent OE duty.
+
+endmenu

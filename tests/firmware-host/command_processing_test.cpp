@@ -111,6 +111,7 @@ void CheckProtocolFormats() {
     CHECK(master.sync_request.sync_id == 0x0123456789abcdefULL);
     CHECK(master.sync_request.master_t1_us == 123456);
     CHECK(master.sync_request.artificial_reply_delay_us == 0);
+    CHECK(!master.sync_request.request_die_temperature);
 
     CHECK(factory_timer::ParseMasterPacket(
         "FCT2|SYNC|0123456789ABCDEF|123456|250000", master, error));
@@ -118,6 +119,15 @@ void CheckProtocolFormats() {
     CHECK(master.sync_request.sync_id == 0x0123456789abcdefULL);
     CHECK(master.sync_request.master_t1_us == 123456);
     CHECK(master.sync_request.artificial_reply_delay_us == 250000);
+    CHECK(!master.sync_request.request_die_temperature);
+
+    CHECK(factory_timer::ParseMasterPacket(
+        "FCT2|SYNC|0123456789ABCDEF|123456|0|TEMP", master, error));
+    CHECK(master.type == factory_timer::MasterPacketType::SyncRequest);
+    CHECK(master.sync_request.sync_id == 0x0123456789abcdefULL);
+    CHECK(master.sync_request.master_t1_us == 123456);
+    CHECK(master.sync_request.artificial_reply_delay_us == 0);
+    CHECK(master.sync_request.request_die_temperature);
 
     CHECK(!factory_timer::ParseMasterPacket(
         "FCT2|SYNC|0123456789ABCDEF|123456|1500001", master, error));
@@ -143,6 +153,13 @@ void CheckProtocolFormats() {
     CHECK(length > 0);
     CHECK(std::string_view(packet, static_cast<std::size_t>(length)) ==
           "FCT2|SYNC_REPLY|ESP02|0123456789ABCDEF|100000|40000|40005");
+
+    length = factory_timer::FormatSyncReply(
+        packet, sizeof(packet), "ESP03", 0x0123456789abcdefULL,
+        100000, 40000, 40005, 0, true, 41250);
+    CHECK(length > 0);
+    CHECK(std::string_view(packet, static_cast<std::size_t>(length)) ==
+          "FCT2|SYNC_REPLY|ESP03|0123456789ABCDEF|100000|40000|40005|0|41250");
 
     const auto start_at = Parse("FCT2|CMD|START_AT|0000000000000010|3|5000000");
     length = factory_timer::FormatAck(

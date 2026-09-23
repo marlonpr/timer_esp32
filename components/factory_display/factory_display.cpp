@@ -1,26 +1,37 @@
 #include "factory_display.h"
 #include "display_backend.h"
+#include "logo_bitmap.h"
 
 #include <algorithm>
 #include <atomic>
-#include <cctype>
 #include <cstdio>
 #include <cstring>
 
+#include "driver/gpio.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "sdkconfig.h"
 
 namespace {
 
 constexpr char kTag[] = "factory_display";
+// S3 refresh is GDMA-driven, so put the presentation scheduler on CPU1 where
+// it is isolated from TimerTask/CommandTask/Wi-Fi on CPU0. Classic ESP32 keeps
+// the display scheduler on CPU0 because CPU1 is dedicated to software HUB75
+// refresh.
+#if CONFIG_IDF_TARGET_ESP32S3
+constexpr BaseType_t kDisplaySchedulerCore = 1;
+#else
 constexpr BaseType_t kDisplaySchedulerCore = 0;
+#endif
 constexpr UBaseType_t kDisplaySchedulerPriority = 12;
 constexpr int64_t kFineLeadUs = 2000;
 constexpr int64_t kTickUs = 1000000LL / configTICK_RATE_HZ;
-constexpr uint32_t kMaxDisplayedSeconds = 99;
+constexpr uint32_t kMaxDisplayedSeconds = 99u * 60u + 59u;
 
 struct DisplayCommand {
     enum class Type : uint8_t { Arm, Reset } type{Type::Reset};
@@ -30,8 +41,15 @@ struct DisplayCommand {
 
 QueueHandle_t s_command_queue = nullptr;
 TaskHandle_t s_display_task = nullptr;
-uint8_t s_idle_value = 0;
 std::atomic<bool> s_ready{false};
+
+void SetPresentationDiagnosticEdge(bool high) {
+#if defined(CONFIG_FACTORY_DISPLAY_EDGE_DIAGNOSTICS) && CONFIG_FACTORY_DISPLAY_EDGE_DIAGNOSTICS
+    gpio_set_level(static_cast<gpio_num_t>(CONFIG_FACTORY_DISPLAY_EDGE_GPIO), high ? 1 : 0);
+#else
+    (void)high;
+#endif
+}
 
 // Seven-segment mask bits: A B C D E F G.
 constexpr uint8_t kA = 1u << 0;
@@ -59,65 +77,105 @@ void Fill(int x, int y, int w, int h, uint8_t r, uint8_t g, uint8_t b) {
     factory_display_backend_fill_rect(x, y, w, h, r, g, b);
 }
 
-void DrawDigit(int origin_x, uint8_t digit, uint8_t r, uint8_t g, uint8_t b) {
+void DrawDigitMmSs(int origin_x, uint8_t digit, uint8_t r, uint8_t g, uint8_t b) {
     if (digit > 9) return;
 
-    constexpr int y = 1;
-    constexpr int thickness = 4;
-    constexpr int horizontal_length = 14;
-    constexpr int right_x = 18;
+    // Compact 11x30 seven-segment digit. Four digits plus a colon fit in 64x32.
+    constexpr int thickness = 3;
+    constexpr int horizontal_length = 7;
+    constexpr int right_x = 8;
+    constexpr int top_y = 1;
     constexpr int upper_vertical_y = 4;
-    constexpr int lower_vertical_y = 17;
-    constexpr int vertical_height = 9;
-    constexpr int middle_y = 13;
-    constexpr int bottom_y = 26;
+    constexpr int upper_vertical_height = 9;
+    constexpr int middle_y = 14;
+    constexpr int lower_vertical_y = 18;
+    constexpr int lower_vertical_height = 9;
+    constexpr int bottom_y = 28;
 
     const uint8_t mask = kDigitSegments[digit];
 
-    // Digit 1 has no horizontal segments, so the normal seven-segment geometry
-    // would leave it visibly shorter than 0 (top blank 4 px / bottom blank 6 px).
-    // Extend only its two right-hand segments so its visible bounding box is
-    // y=1..29, exactly the same height as digit 0, while keeping the center gap.
+    // Digits 1, 4 and 7 have fewer horizontal segments than the rounded
+    // seven-segment shapes, so the normal geometry makes them look shorter.
+    // Extend their vertical strokes to the same y=1..29 visual height while
+    // preserving the compact MM:SS center gap.
     if (digit == 1) {
-        constexpr int one_upper_y = 1;
-        constexpr int one_upper_height = 12;  // y=1..12
-        constexpr int one_lower_y = 17;
-        constexpr int one_lower_height = 13;  // y=17..29
-        Fill(origin_x + right_x, one_upper_y, thickness, one_upper_height, r, g, b);
-        Fill(origin_x + right_x, one_lower_y, thickness, one_lower_height, r, g, b);
+        Fill(origin_x + right_x, 1, thickness, 12, r, g, b);   // y=1..12
+        Fill(origin_x + right_x, 18, thickness, 12, r, g, b);  // y=18..29
         return;
     }
 
-    if (mask & kA) Fill(origin_x + 4, y, horizontal_length, thickness, r, g, b);
-    if (mask & kB) Fill(origin_x + right_x, upper_vertical_y, thickness, vertical_height, r, g, b);
-    if (mask & kC) Fill(origin_x + right_x, lower_vertical_y, thickness, vertical_height, r, g, b);
-    if (mask & kD) Fill(origin_x + 4, bottom_y, horizontal_length, thickness, r, g, b);
-    if (mask & kE) Fill(origin_x, lower_vertical_y, thickness, vertical_height, r, g, b);
-    if (mask & kF) Fill(origin_x, upper_vertical_y, thickness, vertical_height, r, g, b);
-    if (mask & kG) Fill(origin_x + 4, middle_y, horizontal_length, thickness, r, g, b);
+    if (digit == 4) {
+        Fill(origin_x, 1, thickness, 12, r, g, b);             // F: y=1..12
+        Fill(origin_x + right_x, 1, thickness, 12, r, g, b);  // B: y=1..12
+        Fill(origin_x + 2, middle_y, horizontal_length, thickness, r, g, b);
+        Fill(origin_x + right_x, 18, thickness, 12, r, g, b); // C: y=18..29
+        return;
+    }
+
+    if (digit == 7) {
+        Fill(origin_x + 2, top_y, horizontal_length, thickness, r, g, b);
+        Fill(origin_x + right_x, 1, thickness, 12, r, g, b);  // B: y=1..12
+        Fill(origin_x + right_x, 18, thickness, 12, r, g, b); // C: y=18..29
+        return;
+    }
+
+    if (mask & kA) Fill(origin_x + 2, top_y, horizontal_length, thickness, r, g, b);
+    if (mask & kB) Fill(origin_x + right_x, upper_vertical_y, thickness,
+                        upper_vertical_height, r, g, b);
+    if (mask & kC) Fill(origin_x + right_x, lower_vertical_y, thickness,
+                        lower_vertical_height, r, g, b);
+    if (mask & kD) Fill(origin_x + 2, bottom_y, horizontal_length, thickness, r, g, b);
+    if (mask & kE) Fill(origin_x, lower_vertical_y, thickness,
+                        lower_vertical_height, r, g, b);
+    if (mask & kF) Fill(origin_x, upper_vertical_y, thickness,
+                        upper_vertical_height, r, g, b);
+    if (mask & kG) Fill(origin_x + 2, middle_y, horizontal_length, thickness, r, g, b);
 }
 
-void RenderTwoDigits(uint32_t value, uint8_t r, uint8_t g, uint8_t b) {
-    value = std::min<uint32_t>(value, kMaxDisplayedSeconds);
+void DrawColon(uint8_t r, uint8_t g, uint8_t b) {
+    // Centered between minute and second pairs.
+    Fill(30, 9, 3, 3, r, g, b);
+    Fill(30, 20, 3, 3, r, g, b);
+}
+
+void RenderMinutesSeconds(uint32_t total_seconds, uint8_t r, uint8_t g, uint8_t b) {
+    total_seconds = std::min<uint32_t>(total_seconds, kMaxDisplayedSeconds);
+    const uint32_t minutes = total_seconds / 60u;
+    const uint32_t seconds = total_seconds % 60u;
+
     factory_display_backend_clear();
 
-    constexpr int left_x = 7;
-    constexpr int right_x = 35;
-    DrawDigit(left_x, static_cast<uint8_t>((value / 10) % 10), r, g, b);
-    DrawDigit(right_x, static_cast<uint8_t>(value % 10), r, g, b);
+    // 1..11, 14..24, colon 30..32, 37..47, 50..60.
+    DrawDigitMmSs(1,  static_cast<uint8_t>((minutes / 10u) % 10u), r, g, b);
+    DrawDigitMmSs(14, static_cast<uint8_t>(minutes % 10u), r, g, b);
+    DrawColon(r, g, b);
+    DrawDigitMmSs(37, static_cast<uint8_t>((seconds / 10u) % 10u), r, g, b);
+    DrawDigitMmSs(50, static_cast<uint8_t>(seconds % 10u), r, g, b);
 }
 
 void RenderIdleToBackBuffer() {
-    // Device identity in dim blue: ESP01 -> 01, ... ESP05 -> 05.
-    RenderTwoDigits(s_idle_value, 0, 64, 255);
+    // Full-panel 64x32 RGB888 logo. The source bitmap is stored as 0xRRGGBB.
+    // Classic ESP32 quantizes each channel to its existing 3-bit BCM format;
+    // ESP32-S3 keeps the existing HUB75 driver's configured color depth.
+    factory_display_backend_clear();
+    for (int y = 0; y < kIdleLogoHeight; ++y) {
+        for (int x = 0; x < kIdleLogoWidth; ++x) {
+            const uint32_t color =
+                kIdleLogoBitmap[y * kIdleLogoWidth + x];
+            const uint8_t r = static_cast<uint8_t>((color >> 16) & 0xFFu);
+            const uint8_t g = static_cast<uint8_t>((color >> 8) & 0xFFu);
+            const uint8_t b = static_cast<uint8_t>(color & 0xFFu);
+            factory_display_backend_set_pixel(x, y, r, g, b);
+        }
+    }
 }
 
 void RenderRunningToBackBuffer(uint32_t remaining_seconds) {
-    RenderTwoDigits(remaining_seconds, 0, 255, 0);
+    RenderMinutesSeconds(remaining_seconds, 0, 255, 0);
 }
 
 void RenderFinishedToBackBuffer() {
-    RenderTwoDigits(0, 255, 0, 0);
+    RenderMinutesSeconds(0, 255, 0, 0);
 }
 
 bool TryReceiveReplacement(DisplayCommand* replacement) {
@@ -170,6 +228,7 @@ void DisplayTask(void*) {
         while (TryReceiveReplacement(&newest)) command = newest;
 
         if (command.type == DisplayCommand::Type::Reset) {
+            SetPresentationDiagnosticEdge(false);
             RenderIdleToBackBuffer();
             factory_display_backend_flip();
             continue;
@@ -177,9 +236,12 @@ void DisplayTask(void*) {
 
         if (command.duration_seconds > kMaxDisplayedSeconds) {
             ESP_LOGW(kTag,
-                     "Display is two-digit for this test; duration=%u will show 99 until remaining <=99",
+                     "MM:SS display supports up to 99:59; duration=%u will show 99:59 until remaining <=5999",
                      static_cast<unsigned>(command.duration_seconds));
         }
+
+        // Re-arm the presentation diagnostic low before this countdown.
+        SetPresentationDiagnosticEdge(false);
 
         // Make the idle/device ID frame visible while armed, then pre-render
         // the first countdown frame. Nothing visible changes until deadline.
@@ -194,16 +256,27 @@ void DisplayTask(void*) {
             continue;
         }
 
-        const int64_t start_flip_us = esp_timer_get_time();
+        const int64_t start_flip_request_us = esp_timer_get_time();
         factory_display_backend_flip();
-        const int64_t start_lateness_us = start_flip_us - command.local_start_us;
+        const int64_t start_flip_commit_us = esp_timer_get_time();
+        // This diagnostic marks software presentation commit. On S3 the GDMA
+        // backend returns only after the new descriptor chain is active. On
+        // classic ESP32 it marks the front/back pointer swap; actual photons
+        // may follow by up to roughly one software-scan frame.
+        SetPresentationDiagnosticEdge(true);
+
+        const int64_t request_lateness_us =
+            start_flip_request_us - command.local_start_us;
+        const int64_t commit_lateness_us =
+            start_flip_commit_us - command.local_start_us;
         ESP_LOGI(kTag,
-                 "Visual countdown started: duration=%u target_local_us=%lld flip_call_lateness_us=%lld",
+                 "Visual countdown started: duration=%u target_local_us=%lld flip_request_lateness_us=%lld flip_commit_lateness_us=%lld",
                  static_cast<unsigned>(command.duration_seconds),
                  static_cast<long long>(command.local_start_us),
-                 static_cast<long long>(start_lateness_us));
+                 static_cast<long long>(request_lateness_us),
+                 static_cast<long long>(commit_lateness_us));
 
-        int64_t worst_flip_lateness_us = start_lateness_us;
+        int64_t worst_flip_lateness_us = commit_lateness_us;
         bool superseded = false;
 
         for (uint32_t elapsed = 1; elapsed <= command.duration_seconds; ++elapsed) {
@@ -223,10 +296,10 @@ void DisplayTask(void*) {
                 break;
             }
 
-            const int64_t flip_us = esp_timer_get_time();
             factory_display_backend_flip();
+            const int64_t flip_commit_us = esp_timer_get_time();
             worst_flip_lateness_us = std::max(worst_flip_lateness_us,
-                                               flip_us - boundary_us);
+                                               flip_commit_us - boundary_us);
         }
 
         if (!superseded) {
@@ -238,23 +311,29 @@ void DisplayTask(void*) {
     }
 }
 
-uint8_t ParseDeviceIdleValue(const char* device_id) {
-    if (device_id == nullptr) return 0;
-    const size_t length = std::strlen(device_id);
-    if (length >= 2 && std::isdigit(static_cast<unsigned char>(device_id[length - 2])) &&
-        std::isdigit(static_cast<unsigned char>(device_id[length - 1]))) {
-        return static_cast<uint8_t>((device_id[length - 2] - '0') * 10 +
-                                    (device_id[length - 1] - '0'));
-    }
-    return 0;
-}
 
 }  // namespace
 
 extern "C" bool factory_display_init(const char* device_id, uint8_t brightness) {
     if (s_ready.load()) return true;
 
-    s_idle_value = ParseDeviceIdleValue(device_id);
+    // Device identity remains part of the protocol/configuration, but the idle
+    // panel now shows the common logo instead of the numeric device ID.
+    (void)device_id;
+
+#if defined(CONFIG_FACTORY_DISPLAY_EDGE_DIAGNOSTICS) && CONFIG_FACTORY_DISPLAY_EDGE_DIAGNOSTICS
+    gpio_config_t presentation_gpio{};
+    presentation_gpio.pin_bit_mask = 1ULL << CONFIG_FACTORY_DISPLAY_EDGE_GPIO;
+    presentation_gpio.mode = GPIO_MODE_OUTPUT;
+    presentation_gpio.pull_up_en = GPIO_PULLUP_DISABLE;
+    presentation_gpio.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    presentation_gpio.intr_type = GPIO_INTR_DISABLE;
+    ESP_ERROR_CHECK(gpio_config(&presentation_gpio));
+    SetPresentationDiagnosticEdge(false);
+    ESP_LOGI(kTag, "Presentation-commit diagnostic enabled on GPIO%d",
+             CONFIG_FACTORY_DISPLAY_EDGE_GPIO);
+#endif
+
     if (!factory_display_backend_init(brightness)) {
         ESP_LOGE(kTag, "HUB75 backend initialization failed");
         return false;
@@ -279,11 +358,16 @@ extern "C" bool factory_display_init(const char* device_id, uint8_t brightness) 
 
     s_ready.store(true);
     ESP_LOGI(kTag,
-             "64x32 countdown display ready: idle=%02u scheduler_core=%d priority=%u",
-             static_cast<unsigned>(s_idle_value),
+             "64x32 countdown display ready: idle=logo running=MM:SS scheduler_core=%d priority=%u",
              static_cast<int>(kDisplaySchedulerCore),
              static_cast<unsigned>(kDisplaySchedulerPriority));
     return true;
+}
+
+extern "C" void factory_display_set_brightness_percent(uint8_t brightness_percent) {
+    if (!s_ready.load()) return;
+    if (brightness_percent > 100) brightness_percent = 100;
+    factory_display_backend_set_brightness_percent(brightness_percent);
 }
 
 extern "C" void factory_display_arm(int64_t local_start_us,

@@ -99,3 +99,19 @@ Digit `1` now uses the same vertical bounding box as digit `0` on the 64x32 pane
 - `1`: y = 1..29 (1 free pixel above, 2 below)
 
 Only digit `1` is changed. Its right-side upper/lower strokes are extended while the center gap remains unchanged. This affects both classic ESP32 and ESP32-S3 builds because they share `factory_display.cpp`.
+
+## v5 presentation-timing hardening
+
+This revision isolates display presentation timing without changing the validated START scheduler.
+
+- `TimerTask` no longer emits the long `Countdown started` UART log at the exact START deadline. The exact timestamps are queued and the log is emitted later by `CommandTask`, with `deferred_log_delay_us` for observability.
+- On ESP32-S3, `DisplayTask` is pinned to CPU1. The S3 HUB75 refresh remains LCD_CAM/GDMA hardware-driven, while TimerTask, CommandTask and the Wi-Fi driver remain on CPU0.
+- On classic ESP32, `DisplayTask` remains on CPU0 because CPU1 is dedicated to the priority-20 software HUB75 refresh task.
+- Visual timing now logs both `flip_request_lateness_us` and `flip_commit_lateness_us`.
+- Optional `FACTORY_DISPLAY_EDGE_DIAGNOSTICS` adds a second rising timing edge immediately after the START frame flip returns. It is disabled by default; set a verified free `CONFIG_FACTORY_DISPLAY_EDGE_GPIO` per board.
+
+The display diagnostic is a **software presentation-commit** measurement, not an optical measurement. On S3, the GDMA backend waits for frame-boundary handoff before returning. On classic ESP32, the backend swaps front/back pointers immediately, so actual LED emission can follow within the software scan frame. A photodiode is required to measure photon-level presentation onset.
+
+For the external analyzer, keep the same analyzer input mapping and move each device's analyzer wire between the scheduler-edge output and the presentation-commit output for the two separate 30-trial runs.
+
+For the ESP32-S3 ETH unit, do not use GPIO21 for either diagnostic because HUB75 OE uses GPIO21. Choose diagnostic GPIOs that also avoid the board's W5500/Ethernet pins.

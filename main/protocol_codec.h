@@ -13,7 +13,7 @@ constexpr uint32_t kMinStartDelayMs = 100;
 constexpr uint32_t kMaxStartDelayMs = 10000;
 constexpr uint32_t kMaxSyncArtificialReplyDelayUs = 1500000;
 
-enum class CommandType { Start, StartAt, Reset, StatusRequest };
+enum class CommandType { Start, StartAt, Reset, StatusRequest, Brightness };
 enum class TimerState { Ready, Armed, Running, Finished };
 enum class AckResult { Accepted, Duplicate, NotSynced, Late };
 
@@ -37,6 +37,7 @@ enum class ParseError {
     Offset,
     Rtt,
     Delay,
+    Brightness,
 };
 
 struct CommandPacket {
@@ -45,6 +46,7 @@ struct CommandPacket {
     uint32_t duration_seconds{};
     uint32_t start_delay_ms{};
     int64_t start_at_master_us{};
+    uint8_t brightness_percent{};
 };
 
 struct SyncRequestPacket {

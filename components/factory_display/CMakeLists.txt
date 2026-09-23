@@ -1,6 +1,10 @@
+set(FACTORY_DISPLAY_SRCS
+    "factory_display.cpp"
+    "logo_bitmap.cpp"
+)
+
 if(IDF_TARGET STREQUAL "esp32")
-    set(FACTORY_DISPLAY_SRCS
-        "factory_display.cpp"
+    list(APPEND FACTORY_DISPLAY_SRCS
         "esp32/factory_display_backend_esp32.c"
     )
     set(FACTORY_DISPLAY_REQUIRES
@@ -10,8 +14,7 @@ if(IDF_TARGET STREQUAL "esp32")
         esp_system
     )
 elseif(IDF_TARGET STREQUAL "esp32s3")
-    set(FACTORY_DISPLAY_SRCS
-        "factory_display.cpp"
+    list(APPEND FACTORY_DISPLAY_SRCS
         "s3/factory_display_backend_s3.cpp"
     )
     set(FACTORY_DISPLAY_REQUIRES

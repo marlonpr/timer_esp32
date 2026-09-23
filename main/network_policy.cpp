@@ -4,7 +4,8 @@ namespace factory_timer {
 
 namespace {
 constexpr uint32_t kExpectedNetwork = 0xC0A80000u;  // 192.168.0.0
-constexpr uint32_t kExpectedNetmask = 0xFFFF0000u;  // 255.255.0.0
+constexpr uint32_t kExpectedNetmask = 0xFFFFFF00u;  // /24
+// //constexpr uint32_t kExpectedNetmask = 0xFFFF0000u;  // 255.255.0.0  /16
 constexpr uint32_t kExpectedGateway = 0xC0A80001u;  // 192.168.0.1
 } // namespace
 

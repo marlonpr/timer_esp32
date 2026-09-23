@@ -94,6 +94,8 @@ bool ParseCommandFields(std::string_view packet, CommandPacket& output, ParseErr
         parsed.type = CommandType::Reset;
     } else if (fields[2] == "STATUS_REQUEST" && fields[0] == kVersion1) {
         parsed.type = CommandType::StatusRequest;
+    } else if (fields[2] == "BRIGHTNESS" && fields[0] == kVersion2) {
+        parsed.type = CommandType::Brightness;
     } else {
         error = ParseError::CommandType;
         return false;
@@ -102,6 +104,19 @@ bool ParseCommandFields(std::string_view packet, CommandPacket& output, ParseErr
     if (!ParseCommandId(fields[3], parsed.command_id)) {
         error = ParseError::CommandId;
         return false;
+    }
+
+    if (parsed.type == CommandType::Brightness) {
+        uint32_t brightness = 0;
+        uint32_t reserved = 0;
+        if (!ParseDecimal(fields[4], brightness) || brightness > 100 ||
+            !ParseDecimal(fields[5], reserved) || reserved != 0) {
+            error = ParseError::Brightness;
+            return false;
+        }
+        parsed.brightness_percent = static_cast<uint8_t>(brightness);
+        output = parsed;
+        return true;
     }
 
     if (!ParseDecimal(fields[4], parsed.duration_seconds) ||
@@ -274,6 +289,7 @@ const char* ParseErrorName(ParseError error) {
         case ParseError::Offset: return "invalid clock offset";
         case ParseError::Rtt: return "invalid RTT";
         case ParseError::Delay: return "invalid artificial delay";
+        case ParseError::Brightness: return "invalid brightness";
     }
     return "unknown";
 }
@@ -284,6 +300,7 @@ const char* CommandTypeName(CommandType type) {
         case CommandType::StartAt: return "START_AT";
         case CommandType::Reset: return "RESET";
         case CommandType::StatusRequest: return "STATUS_REQUEST";
+        case CommandType::Brightness: return "BRIGHTNESS";
     }
     return "STATUS_REQUEST";
 }

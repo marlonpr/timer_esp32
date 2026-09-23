@@ -46,13 +46,33 @@ endmenu
 
 menu "Factory HUB75 countdown display"
 
+config FACTORY_DISPLAY_EDGE_DIAGNOSTICS
+    bool "Enable display presentation-commit diagnostic GPIO"
+    default n
+    depends on FACTORY_DISPLAY_TEST
+    help
+        Optional second timing output. It rises immediately after the START
+        frame flip/commit returns and is driven low again when re-armed/reset.
+        Use it to measure scheduler-to-presentation software latency with the
+        external analyzer. This is not an optical/photon sensor.
+
+config FACTORY_DISPLAY_EDGE_GPIO
+    int "Display presentation-commit diagnostic GPIO"
+    range 0 48
+    default 22
+    depends on FACTORY_DISPLAY_EDGE_DIAGNOSTICS
+    help
+        GPIO connected to the analyzer for the presentation-commit edge. The
+        feature is disabled by default because free pins differ by board. Make
+        sure it does not overlap HUB75, Ethernet, UART, or START diagnostic pins.
+
 config FACTORY_DISPLAY_TEST
     bool "Enable 64x32 HUB75 visual countdown test"
     default y
     help
-        Enables one 64x32 P5 panel per timer. The panel shows the device number
-        while idle, changes to the countdown exactly at the local START deadline,
-        decrements once per second, and shows red 00 when finished.
+        Enables one 64x32 P5 panel per timer. The panel shows the Bobcat logo
+        while idle/armed, changes to a green MM:SS countdown exactly at the local
+        START deadline, decrements once per second, and shows red 00:00 when finished.
 
 config FACTORY_DISPLAY_BRIGHTNESS
     int "Countdown display brightness (0-255)"

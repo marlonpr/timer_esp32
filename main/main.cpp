@@ -84,6 +84,7 @@ struct TimerStartEvent {
     sockaddr_in peer{};
     bool have_peer{};
     int64_t actual_local_start_us{};
+    int64_t target_local_start_us{};
     int64_t estimated_master_start_us{-1};
     int64_t target_master_start_us{};
 };
@@ -590,6 +591,7 @@ void TimerTask(void *) {
                 after.state == factory_timer::TimerState::Running) {
                 event.snapshot = after;
                 event.actual_local_start_us = now;
+                event.target_local_start_us = target_local_us;
 
                 if (scheduled_start_metadata.valid &&
                     scheduled_start_metadata.command_id == after.last_command_id) {
@@ -620,14 +622,11 @@ void TimerTask(void *) {
                 continue;
             }
 
-            ESP_LOGI(kTag,
-                     "Countdown started: remaining=%u command=%016llX local_us=%lld estimated_master_us=%lld scheduler_lateness_us=%lld",
-                     static_cast<unsigned>(event.snapshot.remaining_seconds),
-                     static_cast<unsigned long long>(event.snapshot.last_command_id),
-                     static_cast<long long>(event.actual_local_start_us),
-                     static_cast<long long>(event.estimated_master_start_us),
-                     static_cast<long long>(event.actual_local_start_us - target_local_us));
-
+            // Do not log from TimerTask at the START deadline. At 115200 baud a
+            // long ESP_LOGI line can block once the UART TX FIFO fills and, on
+            // classic ESP32, delay the lower-priority display flip on CPU0 by
+            // milliseconds. Preserve the exact start timestamps in TimerStartEvent
+            // and log them later from CommandTask.
             if (xQueueSend(timer_event_queue, &event, 0) != pdTRUE) {
                 ESP_LOGW(kTag,
                          "Timer event queue full; STARTED telemetry may be missing for command=%016llX",
@@ -803,7 +802,21 @@ void CommandTask(void *) {
                     last_peer = peer;
                     have_peer = true;
 
-                    if (command.type == factory_timer::CommandType::StartAt &&
+                    if (command.type == factory_timer::CommandType::Brightness) {
+#if defined(CONFIG_FACTORY_DISPLAY_TEST) && CONFIG_FACTORY_DISPLAY_TEST
+                        factory_display_set_brightness_percent(command.brightness_percent);
+#endif
+                        ESP_LOGI(kTag, "Panel brightness command accepted: brightness=%u%% command=%016llX",
+                                 static_cast<unsigned>(command.brightness_percent),
+                                 static_cast<unsigned long long>(command.command_id));
+                        SendAck(socket_fd, peer, command, factory_timer::AckResult::Accepted);
+                        xSemaphoreTake(countdown_mutex, portMAX_DELAY);
+                        const auto snapshot = countdown.Snapshot();
+                        xSemaphoreGive(countdown_mutex);
+                        SendStatus(socket_fd, peer, snapshot);
+                        last_snapshot = snapshot;
+                        last_heartbeat = receive_local_us;
+                    } else if (command.type == factory_timer::CommandType::StartAt &&
                         !clock_sync.valid.load(std::memory_order_acquire)) {
                         ESP_LOGW(kTag,
                                  "START_AT rejected because device clock is not synchronized: command=%016llX",
@@ -875,6 +888,18 @@ void CommandTask(void *) {
 
         TimerStartEvent timer_event{};
         while (xQueueReceive(timer_event_queue, &timer_event, 0) == pdTRUE) {
+            const int64_t deferred_log_us = esp_timer_get_time();
+            ESP_LOGI(kTag,
+                     "Countdown started: remaining=%u command=%016llX local_us=%lld estimated_master_us=%lld scheduler_lateness_us=%lld deferred_log_delay_us=%lld",
+                     static_cast<unsigned>(timer_event.snapshot.remaining_seconds),
+                     static_cast<unsigned long long>(timer_event.snapshot.last_command_id),
+                     static_cast<long long>(timer_event.actual_local_start_us),
+                     static_cast<long long>(timer_event.estimated_master_start_us),
+                     static_cast<long long>(timer_event.actual_local_start_us -
+                                            timer_event.target_local_start_us),
+                     static_cast<long long>(deferred_log_us -
+                                            timer_event.actual_local_start_us));
+
             if (timer_event.have_peer && timer_event.target_master_start_us > 0) {
                 SendStarted(socket_fd, timer_event.peer, timer_event.snapshot,
                             timer_event.actual_local_start_us,

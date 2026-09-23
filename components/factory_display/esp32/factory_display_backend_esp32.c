@@ -211,6 +211,13 @@ bool factory_display_backend_init(uint8_t brightness) {
     return true;
 }
 
+void factory_display_backend_set_brightness_percent(uint8_t brightness_percent) {
+    if (brightness_percent > 100) brightness_percent = 100;
+    global_brightness_pct = brightness_percent;
+    update_oe_duty();
+    ESP_LOGI(TAG, "Panel brightness set to %u%%", (unsigned)global_brightness_pct);
+}
+
 void factory_display_backend_clear(void) {
     for (int plane = 0; plane < COLOR_DEPTH; ++plane) {
         memset(back_planes[plane], 0, PHY_HEIGHT * PHY_WIDTH);
@@ -224,6 +231,10 @@ void factory_display_backend_fill_rect(int x, int y, int width, int height,
             panel_set_pixel(px, py, r, g, b);
         }
     }
+}
+
+void factory_display_backend_set_pixel(int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+    panel_set_pixel(x, y, r, g, b);
 }
 
 void factory_display_backend_flip(void) {

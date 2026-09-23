@@ -175,7 +175,22 @@ void CheckProtocolFormats() {
 
 } // namespace
 
+
+void TestBrightnessCommandParsing() {
+    const auto brightness = Parse("FCT2|CMD|BRIGHTNESS|00000000000000B1|37|0");
+    CHECK(brightness.type == factory_timer::CommandType::Brightness);
+    CHECK(brightness.command_id == 0xB1);
+    CHECK(brightness.brightness_percent == 37);
+
+    factory_timer::CommandPacket ignored{};
+    factory_timer::ParseError error{};
+    CHECK(!factory_timer::ParseCommand(
+        "FCT2|CMD|BRIGHTNESS|00000000000000B1|101|0", ignored, error));
+    CHECK(error == factory_timer::ParseError::Brightness);
+}
+
 int main() {
+    TestBrightnessCommandParsing();
     CheckDebugMacroConfiguration();
     CheckLegacyCountdownBehavior();
     CheckAbsoluteCountdownBehavior();

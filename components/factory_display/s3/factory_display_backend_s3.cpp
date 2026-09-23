@@ -40,7 +40,6 @@ config.pins.oe = 10;
 config.pins.clk = 8;
 
 	
-	
 /*
 //============================ HUB75 ETH Development Board ================================
 
@@ -65,10 +64,7 @@ config.pins.e = -1;
 config.pins.lat = 16;
 config.pins.oe  = 21;
 config.pins.clk = 47;
-
-//==========================================================================================
 */
-	
 
     return config;
 }
@@ -99,6 +95,17 @@ extern "C" bool factory_display_backend_init(uint8_t brightness) {
     return true;
 }
 
+extern "C" void factory_display_backend_set_brightness_percent(uint8_t brightness_percent) {
+    if (!s_driver) return;
+    if (brightness_percent > 100) brightness_percent = 100;
+    const uint8_t driver_brightness = static_cast<uint8_t>(
+        (static_cast<unsigned>(brightness_percent) * 255U + 50U) / 100U);
+    s_driver->set_brightness(driver_brightness);
+    ESP_LOGI(kTag, "Panel brightness set to %u%% (driver=%u)",
+             static_cast<unsigned>(brightness_percent),
+             static_cast<unsigned>(driver_brightness));
+}
+
 extern "C" void factory_display_backend_clear(void) {
     if (s_driver) s_driver->clear();
 }
@@ -109,6 +116,11 @@ extern "C" void factory_display_backend_fill_rect(int x, int y, int width, int h
     s_driver->fill(static_cast<uint16_t>(x), static_cast<uint16_t>(y),
                    static_cast<uint16_t>(width), static_cast<uint16_t>(height),
                    r, g, b);
+}
+
+extern "C" void factory_display_backend_set_pixel(int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+    if (!s_driver || x < 0 || y < 0 || x >= 64 || y >= 32) return;
+    s_driver->set_pixel(static_cast<uint16_t>(x), static_cast<uint16_t>(y), r, g, b);
 }
 
 extern "C" void factory_display_backend_flip(void) {

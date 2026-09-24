@@ -171,7 +171,7 @@ void RenderIdleToBackBuffer() {
 }
 
 void RenderRunningToBackBuffer(uint32_t remaining_seconds) {
-    RenderMinutesSeconds(remaining_seconds, 0, 255, 0);
+    RenderMinutesSeconds(remaining_seconds, 255, 0, 0);
 }
 
 void RenderFinishedToBackBuffer() {

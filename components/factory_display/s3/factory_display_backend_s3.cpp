@@ -22,7 +22,7 @@ Hub75Config MakeDisplayConfig(uint8_t brightness) {
     config.min_refresh_rate = 150;
     config.brightness = brightness;
 
-
+/*
 // ESP32-S3 DevKitC-1 P5 wiring from S3_P5_test.
 config.pins.r1 = 4;
 config.pins.g1 = 5;
@@ -38,9 +38,11 @@ config.pins.e = -1;
 config.pins.lat = 9;
 config.pins.oe = 10;
 config.pins.clk = 8;
+*/
+
 
 	
-/*
+
 //============================ HUB75 ETH Development Board ================================
 
 // Upper RGB
@@ -64,7 +66,7 @@ config.pins.e = -1;
 config.pins.lat = 16;
 config.pins.oe  = 21;
 config.pins.clk = 47;
-*/
+
 
     return config;
 }

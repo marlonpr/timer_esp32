@@ -88,6 +88,36 @@ void CheckAbsoluteCountdownBehavior() {
     CHECK(late.snapshot.state == factory_timer::TimerState::Ready);
 }
 
+void CheckDisciplinedRunningClock() {
+    factory_timer::CountdownTimer timer(20);
+    const auto start_at = Parse("FCT2|CMD|START_AT|0000000000000020|3|2000000");
+
+    const auto accepted = factory_timer::ProcessCommand(
+        timer, start_at, 1000000, 2000000);
+    CHECK(accepted.ack_result == factory_timer::AckResult::Accepted);
+
+    // START is still decided in raw local time, but the running epoch is taken
+    // from the independent disciplined clock domain.
+    auto snapshot = timer.Update(2000000, 10000000);
+    CHECK(snapshot.state == factory_timer::TimerState::Running);
+    CHECK(snapshot.remaining_seconds == 3);
+    CHECK(timer.StartRunningMicroseconds() == 10000000);
+    CHECK(timer.EndRunningMicroseconds() == 13000000);
+
+    // Raw local time can advance by more than a second without decrementing if
+    // the disciplined domain has not yet crossed its absolute 1-second boundary.
+    snapshot = timer.Update(3100000, 10999999);
+    CHECK(snapshot.state == factory_timer::TimerState::Running);
+    CHECK(snapshot.remaining_seconds == 3);
+
+    snapshot = timer.Update(3100001, 11000000);
+    CHECK(snapshot.remaining_seconds == 2);
+
+    snapshot = timer.Update(5200000, 13000000);
+    CHECK(snapshot.state == factory_timer::TimerState::Finished);
+    CHECK(snapshot.remaining_seconds == 0);
+}
+
 void CheckNetworkPolicy() {
     constexpr uint32_t kMask16 = 0xFFFF0000u;
     CHECK(factory_timer::IsAcceptedFactoryNetwork(0xC0A8057Bu, kMask16,
@@ -142,10 +172,10 @@ void CheckProtocolFormats() {
     char packet[factory_timer::kMaxPacketLength + 1]{};
     int length = factory_timer::FormatStatus(
         packet, sizeof(packet), "ESP03", 0x0123456789abcdefULL,
-        factory_timer::TimerState::Running, 19, -57, 6, "AA:BB:CC:DD:EE:FF");
+        factory_timer::TimerState::Running, 19, -57, 6, "AA:BB:CC:DD:EE:FF", "LOCKED");
     CHECK(length > 0);
     CHECK(std::string_view(packet, static_cast<std::size_t>(length)) ==
-          "FCT2|STATUS|ESP03|0123456789ABCDEF|RUNNING|19|-57|6|AA:BB:CC:DD:EE:FF");
+          "FCT2|STATUS|ESP03|0123456789ABCDEF|RUNNING|19|-57|6|AA:BB:CC:DD:EE:FF|LOCKED");
 
     length = factory_timer::FormatSyncReply(
         packet, sizeof(packet), "ESP02", 0x0123456789abcdefULL,
@@ -194,6 +224,7 @@ int main() {
     CheckDebugMacroConfiguration();
     CheckLegacyCountdownBehavior();
     CheckAbsoluteCountdownBehavior();
+    CheckDisciplinedRunningClock();
     CheckNetworkPolicy();
     CheckProtocolFormats();
     if (failures != 0) return 1;

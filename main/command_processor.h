@@ -14,6 +14,7 @@ struct CommandProcessingResult {
 
 CommandProcessingResult ProcessCommand(CountdownTimer& timer, const CommandPacket& command,
                                        int64_t now_microseconds,
-                                       int64_t absolute_local_start_microseconds = 0);
+                                       int64_t absolute_local_start_microseconds = 0,
+                                       int64_t now_running_microseconds = -1);
 
 }  // namespace factory_timer

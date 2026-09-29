@@ -333,16 +333,19 @@ int FormatAck(char* destination, std::size_t capacity, std::string_view device_i
 
 int FormatStatus(char* destination, std::size_t capacity, std::string_view device_id,
                  uint64_t command_id, TimerState state, uint32_t remaining_seconds,
-                 int rssi_dbm, uint8_t wifi_channel, std::string_view bssid) {
+                 int rssi_dbm, uint8_t wifi_channel, std::string_view bssid,
+                 std::string_view rtc_discipline_state) {
     if (destination == nullptr || capacity == 0 || !ValidDeviceId(device_id) ||
-        bssid.size() != 17) return -1;
+        bssid.size() != 17 || rtc_discipline_state.empty() ||
+        rtc_discipline_state.size() > 16) return -1;
     return std::snprintf(destination, capacity,
-                         "FCT2|STATUS|%.*s|%016llX|%s|%u|%d|%u|%.*s",
+                         "FCT2|STATUS|%.*s|%016llX|%s|%u|%d|%u|%.*s|%.*s",
                          static_cast<int>(device_id.size()), device_id.data(),
                          static_cast<unsigned long long>(command_id), TimerStateName(state),
                          static_cast<unsigned>(remaining_seconds), rssi_dbm,
                          static_cast<unsigned>(wifi_channel),
-                         static_cast<int>(bssid.size()), bssid.data());
+                         static_cast<int>(bssid.size()), bssid.data(),
+                         static_cast<int>(rtc_discipline_state.size()), rtc_discipline_state.data());
 }
 
 int FormatSyncReply(char* destination, std::size_t capacity, std::string_view device_id,

@@ -1,6 +1,7 @@
 #include "factory_display.h"
 #include "display_backend.h"
 #include "logo_bitmap.h"
+#include "rtc_discipline.h"
 
 #include <algorithm>
 #include <atomic>
@@ -37,17 +38,33 @@ struct DisplayCommand {
     enum class Type : uint8_t { Arm, Reset } type{Type::Reset};
     int64_t local_start_us{};
     uint32_t duration_seconds{};
+    uint64_t command_id{};
+};
+
+struct DisplayStartAnchor {
+    uint64_t command_id{};
+    int64_t start_disciplined_us{};
 };
 
 QueueHandle_t s_command_queue = nullptr;
+QueueHandle_t s_start_anchor_queue = nullptr;
 TaskHandle_t s_display_task = nullptr;
 std::atomic<bool> s_ready{false};
 
+bool s_presentation_diagnostic_level = false;
+
 void SetPresentationDiagnosticEdge(bool high) {
 #if defined(CONFIG_FACTORY_DISPLAY_EDGE_DIAGNOSTICS) && CONFIG_FACTORY_DISPLAY_EDGE_DIAGNOSTICS
+    s_presentation_diagnostic_level = high;
     gpio_set_level(static_cast<gpio_num_t>(CONFIG_FACTORY_DISPLAY_EDGE_GPIO), high ? 1 : 0);
 #else
     (void)high;
+#endif
+}
+
+void TogglePresentationDiagnosticEdge() {
+#if defined(CONFIG_FACTORY_DISPLAY_EDGE_DIAGNOSTICS) && CONFIG_FACTORY_DISPLAY_EDGE_DIAGNOSTICS
+    SetPresentationDiagnosticEdge(!s_presentation_diagnostic_level);
 #endif
 }
 
@@ -215,6 +232,84 @@ bool WaitUntilOrReplacement(int64_t deadline_us, DisplayCommand* replacement) {
     }
 }
 
+// Wait for a deadline expressed in the continuous DS3231-disciplined domain.
+// Re-resolve it into esp_timer time after each coarse sleep so an anchor/reslope
+// update can adjust the next visible second without introducing a phase jump.
+bool WaitUntilDisciplinedOrReplacement(int64_t disciplined_deadline_us,
+                                        DisplayCommand* replacement,
+                                        int64_t* resolved_local_deadline_us) {
+    while (true) {
+        if (TryReceiveReplacement(replacement)) return false;
+
+        const int64_t local_deadline_us =
+            rtc_discipline_disciplined_to_local_us(disciplined_deadline_us);
+        if (resolved_local_deadline_us != nullptr) {
+            *resolved_local_deadline_us = local_deadline_us;
+        }
+
+        const int64_t now_us = esp_timer_get_time();
+        const int64_t remaining_us = local_deadline_us - now_us;
+        if (remaining_us <= 0) return true;
+
+        if (remaining_us > kFineLeadUs) {
+            const int64_t sleep_budget_us = remaining_us - kFineLeadUs;
+            const TickType_t ticks = static_cast<TickType_t>(sleep_budget_us / kTickUs);
+            if (ticks > 0) {
+                if (xQueueReceive(s_command_queue, replacement, ticks) == pdTRUE) {
+                    return false;
+                }
+                continue;
+            }
+        }
+
+        /*
+         * Freeze the already re-resolved local deadline for the final <=2 ms
+         * spin. The old loop called disciplined_to_local on every iteration,
+         * which enters the discipline critical section each time. A rate update
+         * inside this tiny tail can move the pending deadline only by a tiny
+         * fraction of a microsecond, while repeated critical sections can add
+         * measurable scheduler contention on classic ESP32 core 0.
+         */
+        while (esp_timer_get_time() < local_deadline_us) {
+            if (TryReceiveReplacement(replacement)) return false;
+        }
+        return true;
+    }
+}
+
+bool ReceiveStartAnchor(uint64_t command_id,
+                        int64_t fallback_start_disciplined_us,
+                        int64_t* start_disciplined_us) {
+    if (start_disciplined_us == nullptr) return false;
+
+    // The TimerTask owns the actual Armed -> Running transition. On the S3 the
+    // display task runs on the other core and can reach the first flip slightly
+    // before that task publishes its epoch, so allow a short bounded wait after
+    // the visible START. This does not move the first frame deadline.
+    DisplayStartAnchor anchor{};
+    if (s_start_anchor_queue != nullptr) {
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            if (xQueueReceive(s_start_anchor_queue, &anchor,
+                              pdMS_TO_TICKS(10)) != pdTRUE) {
+                continue;
+            }
+            if (anchor.command_id == command_id &&
+                anchor.start_disciplined_us > 0) {
+                *start_disciplined_us = anchor.start_disciplined_us;
+                return true;
+            }
+            // A superseded command can race with a new arm on the other core.
+            // Discard a stale anchor and continue waiting for the current one.
+        }
+    }
+
+    *start_disciplined_us = fallback_start_disciplined_us;
+    ESP_LOGW(kTag,
+             "Disciplined START anchor unavailable/mismatched for command=%016llX; using local-deadline conversion",
+             static_cast<unsigned long long>(command_id));
+    return false;
+}
+
 void DisplayTask(void*) {
     DisplayCommand command{};
 
@@ -263,7 +358,20 @@ void DisplayTask(void*) {
         // backend returns only after the new descriptor chain is active. On
         // classic ESP32 it marks the front/back pointer swap; actual photons
         // may follow by up to roughly one software-scan frame.
-        SetPresentationDiagnosticEdge(true);
+        // Toggle after every visible countdown commit. With two devices on a
+        // logic analyzer, every edge now represents the same second boundary.
+        TogglePresentationDiagnosticEdge();
+
+        // START itself remains on the proven raw-local deadline. The exact
+        // disciplined epoch is published by the high-priority TimerTask that
+        // owns Armed -> Running. Use local-deadline conversion only as a bounded
+        // fallback if that anchor is unexpectedly unavailable.
+        int64_t start_disciplined_us = 0;
+        const int64_t fallback_start_disciplined_us =
+            rtc_discipline_local_to_disciplined_us(command.local_start_us);
+        ReceiveStartAnchor(command.command_id,
+                           fallback_start_disciplined_us,
+                           &start_disciplined_us);
 
         const int64_t request_lateness_us =
             start_flip_request_us - command.local_start_us;
@@ -287,9 +395,12 @@ void DisplayTask(void*) {
                 RenderRunningToBackBuffer(remaining);
             }
 
-            const int64_t boundary_us =
-                command.local_start_us + static_cast<int64_t>(elapsed) * 1000000LL;
-            if (!WaitUntilOrReplacement(boundary_us, &replacement)) {
+            const int64_t boundary_disciplined_us =
+                start_disciplined_us + static_cast<int64_t>(elapsed) * 1000000LL;
+            int64_t boundary_local_us = 0;
+            if (!WaitUntilDisciplinedOrReplacement(boundary_disciplined_us,
+                                                    &replacement,
+                                                    &boundary_local_us)) {
                 command = replacement;
                 xQueueOverwrite(s_command_queue, &command);
                 superseded = true;
@@ -298,13 +409,18 @@ void DisplayTask(void*) {
 
             factory_display_backend_flip();
             const int64_t flip_commit_us = esp_timer_get_time();
+            TogglePresentationDiagnosticEdge();
+            // Resolve once more for diagnostics in case the rate estimator
+            // re-anchored in the final scheduling window.
+            boundary_local_us =
+                rtc_discipline_disciplined_to_local_us(boundary_disciplined_us);
             worst_flip_lateness_us = std::max(worst_flip_lateness_us,
-                                               flip_commit_us - boundary_us);
+                                               flip_commit_us - boundary_local_us);
         }
 
         if (!superseded) {
             ESP_LOGI(kTag,
-                     "Visual countdown finished: duration=%u worst_flip_call_lateness_us=%lld",
+                     "Visual countdown finished: duration=%u worst_flip_commit_lateness_us=%lld",
                      static_cast<unsigned>(command.duration_seconds),
                      static_cast<long long>(worst_flip_lateness_us));
         }
@@ -340,8 +456,9 @@ extern "C" bool factory_display_init(const char* device_id, uint8_t brightness) 
     }
 
     s_command_queue = xQueueCreate(1, sizeof(DisplayCommand));
-    if (s_command_queue == nullptr) {
-        ESP_LOGE(kTag, "Could not create display command queue");
+    s_start_anchor_queue = xQueueCreate(1, sizeof(DisplayStartAnchor));
+    if (s_command_queue == nullptr || s_start_anchor_queue == nullptr) {
+        ESP_LOGE(kTag, "Could not create display scheduler queues");
         return false;
     }
 
@@ -371,17 +488,37 @@ extern "C" void factory_display_set_brightness_percent(uint8_t brightness_percen
 }
 
 extern "C" void factory_display_arm(int64_t local_start_us,
-                                      uint32_t duration_seconds) {
+                                      uint32_t duration_seconds,
+                                      uint64_t command_id) {
     if (!s_ready.load() || s_command_queue == nullptr) return;
+    if (s_start_anchor_queue != nullptr) {
+        xQueueReset(s_start_anchor_queue);
+    }
     DisplayCommand command{};
     command.type = DisplayCommand::Type::Arm;
     command.local_start_us = local_start_us;
     command.duration_seconds = duration_seconds;
+    command.command_id = command_id;
     xQueueOverwrite(s_command_queue, &command);
+}
+
+extern "C" void factory_display_note_started(uint64_t command_id,
+                                               int64_t start_disciplined_us) {
+    if (!s_ready.load() || s_start_anchor_queue == nullptr ||
+        command_id == 0 || start_disciplined_us <= 0) {
+        return;
+    }
+    DisplayStartAnchor anchor{};
+    anchor.command_id = command_id;
+    anchor.start_disciplined_us = start_disciplined_us;
+    xQueueOverwrite(s_start_anchor_queue, &anchor);
 }
 
 extern "C" void factory_display_reset(void) {
     if (!s_ready.load() || s_command_queue == nullptr) return;
+    if (s_start_anchor_queue != nullptr) {
+        xQueueReset(s_start_anchor_queue);
+    }
     DisplayCommand command{};
     command.type = DisplayCommand::Type::Reset;
     xQueueOverwrite(s_command_queue, &command);

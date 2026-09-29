@@ -27,9 +27,21 @@ public:
 
     AckResult Apply(const CommandPacket& command, int64_t now_microseconds,
                     int64_t absolute_local_start_microseconds = 0);
+
+    // Backward-compatible single-clock update used by host tests and builds
+    // without an external disciplined clock.
     TimerSnapshot Update(int64_t now_microseconds);
+
+    // The scheduled START decision always uses raw local esp_timer time. Once
+    // Armed -> Running occurs, elapsed time is measured only in the supplied
+    // running-clock domain (DS3231-disciplined time in firmware).
+    TimerSnapshot Update(int64_t now_local_microseconds,
+                         int64_t now_running_microseconds);
+
     TimerSnapshot Snapshot() const;
     int64_t ScheduledStartMicroseconds() const { return scheduled_start_microseconds_; }
+    int64_t StartRunningMicroseconds() const { return start_running_microseconds_; }
+    int64_t EndRunningMicroseconds() const { return end_running_microseconds_; }
 
 private:
     bool HasSeen(uint64_t command_id) const;
@@ -43,6 +55,8 @@ private:
     uint32_t remaining_seconds_;
     uint64_t last_command_id_{};
     int64_t scheduled_start_microseconds_{};
+    int64_t start_running_microseconds_{};
+    int64_t end_running_microseconds_{};
 };
 
 }  // namespace factory_timer

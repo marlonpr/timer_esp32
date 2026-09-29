@@ -22,51 +22,21 @@ Hub75Config MakeDisplayConfig(uint8_t brightness) {
     config.min_refresh_rate = 150;
     config.brightness = brightness;
 
-/*
-// ESP32-S3 DevKitC-1 P5 wiring from S3_P5_test.
-config.pins.r1 = 4;
-config.pins.g1 = 5;
-config.pins.b1 = 6;
-config.pins.r2 = 7;
-config.pins.g2 = 15;
-config.pins.b2 = 16;
-config.pins.a = 11;
-config.pins.b = 12;
-config.pins.c = 13;
-config.pins.d = -1;
-config.pins.e = -1;
-config.pins.lat = 9;
-config.pins.oe = 10;
-config.pins.clk = 8;
-*/
-
-
-	
-
-//============================ HUB75 ETH Development Board ================================
-
-// Upper RGB
-config.pins.r1 = 33;
-config.pins.g1 = 34;
-config.pins.b1 = 35;
-
-// Lower RGB
-config.pins.r2 = 36;
-config.pins.g2 = 37;
-config.pins.b2 = 38;
-
-// Address
-config.pins.a = 1;
-config.pins.b = 2;
-config.pins.c = 15;
-config.pins.d = -1;
-config.pins.e = -1;
-
-// Control
-config.pins.lat = 16;
-config.pins.oe  = 21;
-config.pins.clk = 47;
-
+    // ESP32-S3 DevKitC-1 P5 wiring from S3_P5_test.
+    config.pins.r1 = 4;
+    config.pins.g1 = 5;
+    config.pins.b1 = 6;
+    config.pins.r2 = 7;
+    config.pins.g2 = 15;
+    config.pins.b2 = 16;
+    config.pins.a = 11;
+    config.pins.b = 12;
+    config.pins.c = 13;
+    config.pins.d = -1;
+    config.pins.e = -1;
+    config.pins.lat = 9;
+    config.pins.oe = 10;
+    config.pins.clk = 8;
 
     return config;
 }

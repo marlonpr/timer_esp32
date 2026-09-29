@@ -31,6 +31,8 @@ AckResult CountdownTimer::Apply(const CommandPacket& command, int64_t now_micros
     last_command_id_ = command.command_id;
     duration_seconds_ = command.duration_seconds;
     remaining_seconds_ = duration_seconds_;
+    start_running_microseconds_ = 0;
+    end_running_microseconds_ = 0;
 
     if (command.type == CommandType::Start) {
         scheduled_start_microseconds_ =
@@ -47,18 +49,30 @@ AckResult CountdownTimer::Apply(const CommandPacket& command, int64_t now_micros
 }
 
 TimerSnapshot CountdownTimer::Update(int64_t now_microseconds) {
-    if (state_ == TimerState::Armed && now_microseconds >= scheduled_start_microseconds_) {
+    return Update(now_microseconds, now_microseconds);
+}
+
+TimerSnapshot CountdownTimer::Update(int64_t now_local_microseconds,
+                                     int64_t now_running_microseconds) {
+    if (state_ == TimerState::Armed &&
+        now_local_microseconds >= scheduled_start_microseconds_) {
         state_ = TimerState::Running;
+        start_running_microseconds_ = now_running_microseconds;
+        end_running_microseconds_ =
+            start_running_microseconds_ +
+            static_cast<int64_t>(duration_seconds_) * 1000000LL;
     }
 
     if (state_ == TimerState::Running) {
-        const int64_t elapsed = std::max<int64_t>(0, now_microseconds - scheduled_start_microseconds_);
-        const uint64_t elapsed_seconds = static_cast<uint64_t>(elapsed / 1000000);
+        const int64_t elapsed =
+            std::max<int64_t>(0, now_running_microseconds - start_running_microseconds_);
+        const uint64_t elapsed_seconds = static_cast<uint64_t>(elapsed / 1000000LL);
         if (elapsed_seconds >= duration_seconds_) {
             remaining_seconds_ = 0;
             state_ = TimerState::Finished;
         } else {
-            remaining_seconds_ = duration_seconds_ - static_cast<uint32_t>(elapsed_seconds);
+            remaining_seconds_ =
+                duration_seconds_ - static_cast<uint32_t>(elapsed_seconds);
         }
     }
     return Snapshot();

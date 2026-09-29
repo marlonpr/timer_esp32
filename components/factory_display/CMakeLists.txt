@@ -25,6 +25,8 @@ else()
     message(FATAL_ERROR "factory_display supports only ESP32 and ESP32-S3")
 endif()
 
+list(APPEND FACTORY_DISPLAY_REQUIRES rtc_discipline)
+
 idf_component_register(
     SRCS ${FACTORY_DISPLAY_SRCS}
     INCLUDE_DIRS "include" "."

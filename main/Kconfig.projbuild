@@ -36,11 +36,65 @@ config FACTORY_START_EDGE_DIAGNOSTICS
 config FACTORY_START_EDGE_GPIO
     int "Physical START-edge diagnostic GPIO"
     range 0 48
-    default 21
+    default 32 if IDF_TARGET_ESP32
+    default 18 if IDF_TARGET_ESP32S3
+    default 32
     depends on FACTORY_START_EDGE_DIAGNOSTICS
     help
-        GPIO connected to the external/ESP32 logic analyzer. GPIO21 is safe
-        for the current timer-only ESP32 and ESP32-S3 test firmware.
+        GPIO connected to the external/ESP32 logic analyzer. GPIO21/22 are
+        reserved for the DS3231 I2C bus in the disciplined-timing pilot.
+
+endmenu
+
+menu "Factory DS3231 disciplined timing"
+
+config FACTORY_DS3231_DISCIPLINE
+    bool "Enable DS3231 1 Hz disciplined countdown timing"
+    default y
+    help
+        Uses the DS3231 INT/SQW 1 Hz output to continuously estimate the local
+        ESP timer rate. Network synchronization and the existing START deadline
+        path remain unchanged; only elapsed countdown time after START is
+        disciplined.
+
+config FACTORY_DS3231_SQW_GPIO
+    int "DS3231 INT/SQW input GPIO"
+    range 0 48
+    default 27
+    depends on FACTORY_DS3231_DISCIPLINE
+    help
+        Connect DS3231 INT/SQW to this GPIO. GPIO27 is unused by both current
+        HUB75 target pin maps and matches the validated ESP01 pilot wiring.
+        DS3231 SDA is fixed at GPIO21 and SCL at GPIO22.
+
+config FACTORY_RTC_QUAL_LOGS
+    bool "Enable DS3231 qualification logs"
+    default y
+    depends on FACTORY_DS3231_DISCIPLINE
+    help
+        Emits machine-readable RTC_QUAL, RTC_SYNC_QUAL and RTC_START_QUAL
+        records for relative RTC-rate qualification. These diagnostics do not
+        change clock discipline, ARM, START, or countdown behavior.
+
+config FACTORY_RTC_QUAL_LOG_INTERVAL_S
+    int "RTC qualification sample interval (seconds)"
+    range 1 3600
+    default 16
+    depends on FACTORY_RTC_QUAL_LOGS
+    help
+        Fixed cadence for RTC_QUAL estimator samples. 16 seconds gives eight
+        samples per 128-second regression window while keeping UART traffic low.
+
+config FACTORY_RX_BOUNDARY_TRACE
+    bool "Trace control-port RX near display boundaries"
+    default y
+    help
+        Timestamps UDP packets received on the factory control port and queues a
+        low-priority diagnostic record when a packet arrives in the final 15 ms
+        before a running countdown boundary. Logging is deferred so UART output
+        cannot create the timing event being measured. This observes port 5000
+        traffic only; Wi-Fi management frames and unrelated UDP ports remain
+        outside this application-level trace.
 
 endmenu
 
@@ -48,30 +102,33 @@ menu "Factory HUB75 countdown display"
 
 config FACTORY_DISPLAY_EDGE_DIAGNOSTICS
     bool "Enable display presentation-commit diagnostic GPIO"
-    default n
+    default y
     depends on FACTORY_DISPLAY_TEST
     help
-        Optional second timing output. It rises immediately after the START
-        frame flip/commit returns and is driven low again when re-armed/reset.
-        Use it to measure scheduler-to-presentation software latency with the
-        external analyzer. This is not an optical/photon sensor.
+        Validation timing output. It starts low when armed, toggles immediately
+        after the START frame flip/commit, and toggles again after every later
+        one-second presentation commit including 00:00. Put the corresponding
+        GPIO from two devices on the analyzer to measure second-by-second visual
+        commit spread. This is a software commit marker, not an optical sensor.
 
 config FACTORY_DISPLAY_EDGE_GPIO
     int "Display presentation-commit diagnostic GPIO"
     range 0 48
-    default 22
+    default 33 if IDF_TARGET_ESP32
+    default 14 if IDF_TARGET_ESP32S3
+    default 33
     depends on FACTORY_DISPLAY_EDGE_DIAGNOSTICS
     help
-        GPIO connected to the analyzer for the presentation-commit edge. The
-        feature is disabled by default because free pins differ by board. Make
-        sure it does not overlap HUB75, Ethernet, UART, or START diagnostic pins.
+        GPIO connected to the analyzer for presentation-commit toggles. The
+        current defaults are free in the validated panel pin maps: GPIO33 on
+        classic ESP32 and GPIO14 on ESP32-S3. Recheck if board wiring changes.
 
 config FACTORY_DISPLAY_TEST
     bool "Enable 64x32 HUB75 visual countdown test"
     default y
     help
         Enables one 64x32 P5 panel per timer. The panel shows the Bobcat logo
-        while idle/armed, changes to a green MM:SS countdown exactly at the local
+        while idle/armed, changes to a red MM:SS countdown exactly at the local
         START deadline, decrements once per second, and shows red 00:00 when finished.
 
 config FACTORY_DISPLAY_BRIGHTNESS

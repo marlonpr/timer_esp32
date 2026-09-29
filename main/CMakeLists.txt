@@ -11,7 +11,7 @@ idf_component_register(
         "protocol_codec.cpp"
         "network_policy.cpp"
     INCLUDE_DIRS "."
-    REQUIRES driver esp_event esp_netif esp_timer esp_wifi nvs_flash lwip factory_display ${FACTORY_TIMER_EXTRA_REQUIRES}
+    REQUIRES driver esp_event esp_netif esp_timer esp_wifi nvs_flash lwip factory_display rtc_discipline ${FACTORY_TIMER_EXTRA_REQUIRES}
 )
 
 target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_17)

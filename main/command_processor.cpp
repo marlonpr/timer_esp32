@@ -4,7 +4,8 @@ namespace factory_timer {
 
 CommandProcessingResult ProcessCommand(CountdownTimer& timer, const CommandPacket& command,
                                        int64_t now_microseconds,
-                                       int64_t absolute_local_start_microseconds) {
+                                       int64_t absolute_local_start_microseconds,
+                                       int64_t now_running_microseconds) {
     if (command.type == CommandType::StatusRequest) {
         return CommandProcessingResult{false, AckResult::Accepted, timer.Snapshot()};
     }
@@ -15,7 +16,9 @@ CommandProcessingResult ProcessCommand(CountdownTimer& timer, const CommandPacke
     // scheduler in firmware. Command processing may refresh an already-running
     // countdown, but must never start an armed countdown from UDP task context.
     if (snapshot.state != TimerState::Armed) {
-        snapshot = timer.Update(now_microseconds);
+        const int64_t running_now =
+            now_running_microseconds >= 0 ? now_running_microseconds : now_microseconds;
+        snapshot = timer.Update(now_microseconds, running_now);
     }
     return CommandProcessingResult{true, ack_result, snapshot};
 }

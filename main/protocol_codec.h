@@ -79,7 +79,8 @@ int FormatAck(char* destination, std::size_t capacity, std::string_view device_i
               const CommandPacket& command, AckResult result);
 int FormatStatus(char* destination, std::size_t capacity, std::string_view device_id,
                  uint64_t command_id, TimerState state, uint32_t remaining_seconds,
-                 int rssi_dbm, uint8_t wifi_channel, std::string_view bssid);
+                 int rssi_dbm, uint8_t wifi_channel, std::string_view bssid,
+                 std::string_view rtc_discipline_state);
 int FormatSyncReply(char* destination, std::size_t capacity, std::string_view device_id,
                     uint64_t sync_id, int64_t master_t1_us,
                     int64_t local_t2_us, int64_t local_t3_us,

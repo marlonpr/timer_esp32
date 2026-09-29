@@ -119,16 +119,18 @@ void CheckDisciplinedRunningClock() {
 }
 
 void CheckNetworkPolicy() {
-    constexpr uint32_t kMask16 = 0xFFFF0000u;
-    CHECK(factory_timer::IsAcceptedFactoryNetwork(0xC0A8057Bu, kMask16,
+    constexpr uint32_t kMask24 = 0xFFFFFF00u;
+    CHECK(factory_timer::IsAcceptedFactoryNetwork(0xC0A8007Bu, kMask24,
                                                    0xC0A80001u));
-    CHECK(factory_timer::IsAcceptedFactoryNetwork(0xC0A8C807u, kMask16,
+    CHECK(factory_timer::IsAcceptedFactoryNetwork(0xC0A800F0u, kMask24,
                                                    0xC0A80001u));
-    CHECK(!factory_timer::IsAcceptedFactoryNetwork(0x0A2D00AFu, kMask16,
-                                                    0x0A2D00F5u));
-    CHECK(!factory_timer::IsAcceptedFactoryNetwork(0xC0A8057Bu, 0xFFFFFF00u,
+    CHECK(!factory_timer::IsAcceptedFactoryNetwork(0xC0A80107u, kMask24,
                                                     0xC0A80001u));
-    CHECK(!factory_timer::IsAcceptedFactoryNetwork(0xC0A8057Bu, kMask16,
+    CHECK(!factory_timer::IsAcceptedFactoryNetwork(0x0A2D00AFu, kMask24,
+                                                    0x0A2D00F5u));
+    CHECK(!factory_timer::IsAcceptedFactoryNetwork(0xC0A8007Bu, 0xFFFF0000u,
+                                                    0xC0A80001u));
+    CHECK(!factory_timer::IsAcceptedFactoryNetwork(0xC0A8007Bu, kMask24,
                                                     0xC0A80101u));
 }
 

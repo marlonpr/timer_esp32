@@ -1,0 +1,5 @@
+/mnt/data/factory_timer_v6_12_inverse_mapping_trace/tests/firmware-host/build/CMakeFiles/factory_timer_core_debug_0.dir
+/mnt/data/factory_timer_v6_12_inverse_mapping_trace/tests/firmware-host/build/CMakeFiles/factory_timer_core_debug_1.dir
+/mnt/data/factory_timer_v6_12_inverse_mapping_trace/tests/firmware-host/build/CMakeFiles/test.dir
+/mnt/data/factory_timer_v6_12_inverse_mapping_trace/tests/firmware-host/build/CMakeFiles/edit_cache.dir
+/mnt/data/factory_timer_v6_12_inverse_mapping_trace/tests/firmware-host/build/CMakeFiles/rebuild_cache.dir

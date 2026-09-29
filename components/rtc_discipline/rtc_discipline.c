@@ -25,11 +25,24 @@
 #define GAP_RESIDUAL_LIMIT_US 150000.0
 #define OSF_CLEAR_AFTER_VALID_EDGES 3
 #define TEMP_REFRESH_ACCEPTED_EDGES 64
+#define SQW_INTERVAL_WINDOW 64
+#define SQW_TRACE_CAPACITY 128
 
 typedef struct {
     int64_t sequence;
     int64_t local_us;
 } fit_point_t;
+
+typedef struct {
+    int64_t timestamp_us;
+    int32_t core_id;
+} sqw_edge_event_t;
+
+typedef struct {
+    uint32_t sequence;
+    int64_t timestamp_us;
+    int32_t core_id;
+} sqw_trace_record_t;
 
 typedef struct {
     bool initialized;
@@ -50,7 +63,14 @@ typedef struct {
     int64_t next_sequence;
     int64_t last_accepted_local_us;
 
+    int64_t sqw_intervals[SQW_INTERVAL_WINDOW];
+    uint16_t sqw_interval_count;
+    uint16_t sqw_interval_head;
+    int64_t sqw_previous_isr_us;
     volatile uint32_t isr_queue_drops;
+    sqw_trace_record_t sqw_trace[SQW_TRACE_CAPACITY];
+    volatile uint32_t sqw_trace_write_count;
+    volatile uint32_t sqw_trace_overwrites;
     rtc_discipline_status_t status;
 } rtc_discipline_ctx_t;
 
@@ -423,13 +443,66 @@ static void process_edge(int64_t local_us)
     }
 }
 
+static void update_sqw_interval_diagnostics(const sqw_edge_event_t *event)
+{
+    if (!event) return;
+    s_ctx.status.sqw_isr_core_id = event->core_id;
+
+    if (s_ctx.sqw_previous_isr_us > 0) {
+        const int64_t interval_us = event->timestamp_us - s_ctx.sqw_previous_isr_us;
+        s_ctx.status.sqw_last_interval_us = interval_us;
+        s_ctx.sqw_intervals[s_ctx.sqw_interval_head] = interval_us;
+        s_ctx.sqw_interval_head = (uint16_t)((s_ctx.sqw_interval_head + 1u) % SQW_INTERVAL_WINDOW);
+        if (s_ctx.sqw_interval_count < SQW_INTERVAL_WINDOW) s_ctx.sqw_interval_count++;
+
+        double sum = 0.0;
+        for (uint16_t i = 0; i < s_ctx.sqw_interval_count; ++i) sum += (double)s_ctx.sqw_intervals[i];
+        const double mean = sum / (double)s_ctx.sqw_interval_count;
+        double ss = 0.0;
+        double min_v = (double)s_ctx.sqw_intervals[0];
+        double max_v = min_v;
+        for (uint16_t i = 0; i < s_ctx.sqw_interval_count; ++i) {
+            const double v = (double)s_ctx.sqw_intervals[i];
+            const double d = v - mean;
+            ss += d * d;
+            if (v < min_v) min_v = v;
+            if (v > max_v) max_v = v;
+        }
+        s_ctx.status.sqw_interval_samples = s_ctx.sqw_interval_count;
+        s_ctx.status.sqw_interval_mean_us = mean;
+        s_ctx.status.sqw_interval_rms_jitter_us = sqrt(ss / (double)s_ctx.sqw_interval_count);
+        s_ctx.status.sqw_interval_p2p_us = max_v - min_v;
+    }
+    s_ctx.sqw_previous_isr_us = event->timestamp_us;
+}
+
 static void sqw_isr(void *arg)
 {
     (void)arg;
-    const int64_t timestamp_us = esp_timer_get_time();
-    BaseType_t higher_priority_task_woken = pdFALSE;
+    sqw_edge_event_t event = {0};
 
-    if (xQueueSendFromISR(s_ctx.edge_queue, &timestamp_us, &higher_priority_task_woken) != pdTRUE) {
+    /* Timestamp first. v6.17 keeps this path intentionally minimal: no GPIO
+     * marker and no refresh/network correlation reads are performed here. */
+    event.timestamp_us = esp_timer_get_time();
+    event.core_id = (int32_t)xPortGetCoreID();
+
+#if defined(CONFIG_FACTORY_RTC_SQW_CORRELATION_TRACE) && CONFIG_FACTORY_RTC_SQW_CORRELATION_TRACE
+    portENTER_CRITICAL_ISR(&s_ctx.mux);
+    const uint32_t write_count = s_ctx.sqw_trace_write_count++;
+    const uint32_t index = write_count % SQW_TRACE_CAPACITY;
+    if (write_count >= SQW_TRACE_CAPACITY) {
+        s_ctx.sqw_trace_overwrites++;
+    }
+    s_ctx.sqw_trace[index] = (sqw_trace_record_t){
+        .sequence = write_count + 1u,
+        .timestamp_us = event.timestamp_us,
+        .core_id = event.core_id,
+    };
+    portEXIT_CRITICAL_ISR(&s_ctx.mux);
+#endif
+
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    if (xQueueSendFromISR(s_ctx.edge_queue, &event, &higher_priority_task_woken) != pdTRUE) {
         s_ctx.isr_queue_drops++;
     }
 
@@ -443,8 +516,10 @@ static void discipline_task(void *arg)
     (void)arg;
 
     for (;;) {
-        int64_t edge_us = 0;
-        if (xQueueReceive(s_ctx.edge_queue, &edge_us, pdMS_TO_TICKS(500)) == pdTRUE) {
+        sqw_edge_event_t edge = {0};
+        if (xQueueReceive(s_ctx.edge_queue, &edge, pdMS_TO_TICKS(500)) == pdTRUE) {
+            const int64_t edge_us = edge.timestamp_us;
+            update_sqw_interval_diagnostics(&edge);
             rtc_discipline_state_t state;
             taskENTER_CRITICAL(&s_ctx.mux);
             state = s_ctx.status.state;
@@ -535,7 +610,7 @@ esp_err_t rtc_discipline_init(ds3231_dev_t *rtc,
 
     refresh_temperature();
 
-    s_ctx.edge_queue = xQueueCreate(EDGE_QUEUE_DEPTH, sizeof(int64_t));
+    s_ctx.edge_queue = xQueueCreate(EDGE_QUEUE_DEPTH, sizeof(sqw_edge_event_t));
     if (!s_ctx.edge_queue) {
         return ESP_ERR_NO_MEM;
     }
@@ -551,6 +626,7 @@ esp_err_t rtc_discipline_init(ds3231_dev_t *rtc,
     if (err != ESP_OK) {
         return err;
     }
+
 
     err = gpio_install_isr_service(0);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -591,7 +667,41 @@ void rtc_discipline_get_status(rtc_discipline_status_t *out_status)
     taskENTER_CRITICAL(&s_ctx.mux);
     *out_status = s_ctx.status;
     out_status->isr_queue_drops = s_ctx.isr_queue_drops;
+#if defined(CONFIG_FACTORY_RTC_SQW_CORRELATION_TRACE) && CONFIG_FACTORY_RTC_SQW_CORRELATION_TRACE
+    const uint32_t written = s_ctx.sqw_trace_write_count;
+    out_status->sqw_trace_samples = written < SQW_TRACE_CAPACITY ? written : SQW_TRACE_CAPACITY;
+    out_status->sqw_trace_overwrites = s_ctx.sqw_trace_overwrites;
+#endif
     taskEXIT_CRITICAL(&s_ctx.mux);
+}
+
+void rtc_discipline_dump_sqw_trace(void)
+{
+#if defined(CONFIG_FACTORY_RTC_SQW_CORRELATION_TRACE) && CONFIG_FACTORY_RTC_SQW_CORRELATION_TRACE
+    const uint32_t total = s_ctx.sqw_trace_write_count;
+    const uint32_t count = total < SQW_TRACE_CAPACITY ? total : SQW_TRACE_CAPACITY;
+    const uint32_t first_sequence = total > SQW_TRACE_CAPACITY ? (total - SQW_TRACE_CAPACITY + 1u) : 1u;
+
+    ESP_LOGI(TAG,
+             "SQW_TRACE_BEGIN count=%u capacity=%u total=%u overwrites=%u",
+             (unsigned)count,
+             (unsigned)SQW_TRACE_CAPACITY,
+             (unsigned)total,
+             (unsigned)s_ctx.sqw_trace_overwrites);
+    for (uint32_t sequence = first_sequence; sequence <= total; ++sequence) {
+        const uint32_t index = (sequence - 1u) % SQW_TRACE_CAPACITY;
+        taskENTER_CRITICAL(&s_ctx.mux);
+        const sqw_trace_record_t r = s_ctx.sqw_trace[index];
+        taskEXIT_CRITICAL(&s_ctx.mux);
+        if (r.sequence != sequence) continue;
+        ESP_LOGI(TAG,
+                 "SQW_TRACE sequence=%u local_us=%lld core=%d",
+                 (unsigned)r.sequence,
+                 (long long)r.timestamp_us,
+                 (int)r.core_id);
+    }
+    ESP_LOGI(TAG, "SQW_TRACE_END");
+#endif
 }
 
 bool rtc_discipline_is_locked(void)

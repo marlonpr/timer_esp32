@@ -98,3 +98,9 @@ extern "C" void factory_display_backend_set_pixel(int x, int y, uint8_t r, uint8
 extern "C" void factory_display_backend_flip(void) {
     if (s_driver) s_driver->flip_buffer();
 }
+
+extern "C" void factory_display_backend_publish_prepared_from_isr(void) {
+    // S3 keeps the existing GDMA/task-context path. factory_display.cpp calls
+    // the ISR publication API only for CONFIG_IDF_TARGET_ESP32.
+    factory_display_backend_flip();
+}

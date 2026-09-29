@@ -85,6 +85,15 @@ config FACTORY_RTC_QUAL_LOG_INTERVAL_S
         Fixed cadence for RTC_QUAL estimator samples. 16 seconds gives eight
         samples per 128-second regression window while keeping UART traffic low.
 
+config FACTORY_RTC_SQW_CORRELATION_TRACE
+    bool "Buffer raw SQW ISR timestamps"
+    default n
+    depends on FACTORY_DS3231_DISCIPLINE
+    help
+        Diagnostic-only ring buffer. Disabled in the v6.18-A validation build so
+        there is no SQW ISR ring-buffer critical section or trace write. Enable
+        only for dedicated instrumentation runs.
+
 config FACTORY_RX_BOUNDARY_TRACE
     bool "Trace control-port RX near display boundaries"
     default y
@@ -122,6 +131,25 @@ config FACTORY_DISPLAY_EDGE_GPIO
         GPIO connected to the analyzer for presentation-commit toggles. The
         current defaults are free in the validated panel pin maps: GPIO33 on
         classic ESP32 and GPIO14 on ESP32-S3. Recheck if board wiring changes.
+
+config FACTORY_DISPLAY_REFRESH_EDGE_DIAGNOSTICS
+    bool "Enable refresh-side frame-adoption diagnostic GPIO"
+    default y if IDF_TARGET_ESP32
+    default n
+    depends on FACTORY_DISPLAY_EDGE_DIAGNOSTICS && IDF_TARGET_ESP32
+    help
+        Classic ESP32 validation output. The core-1 HUB75 refresh loop toggles
+        this GPIO when it observes a newly published active frame at the start
+        of a complete scan cycle. This measures publish-to-scan adoption.
+
+config FACTORY_DISPLAY_REFRESH_EDGE_GPIO
+    int "Refresh-side frame-adoption diagnostic GPIO"
+    range 0 33
+    default 16
+    depends on FACTORY_DISPLAY_REFRESH_EDGE_DIAGNOSTICS
+    help
+        GPIO connected to a spare analyzer channel. GPIO16 is free in the
+        validated classic ESP32 P5 + DS3231 wiring.
 
 config FACTORY_DISPLAY_TEST
     bool "Enable 64x32 HUB75 visual countdown test"

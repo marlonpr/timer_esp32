@@ -54,6 +54,18 @@ typedef struct {
     bool rtc_temperature_valid;
     bool osf_was_set;
     bool osf_cleared_after_edges;
+
+    /* SQW timestamp-repeatability diagnostics. Statistics are over the most
+     * recent accepted 1-Hz intervals (up to 64). They describe ESP-side
+     * timestamp repeatability, not RTC frequency accuracy. */
+    int32_t sqw_isr_core_id;
+    uint32_t sqw_interval_samples;
+    int64_t sqw_last_interval_us;
+    double sqw_interval_mean_us;
+    double sqw_interval_rms_jitter_us;
+    double sqw_interval_p2p_us;
+    uint32_t sqw_trace_samples;
+    uint32_t sqw_trace_overwrites;
 } rtc_discipline_status_t;
 
 /**
@@ -80,6 +92,12 @@ void rtc_discipline_get_status(rtc_discipline_status_t *out_status);
 
 /** True only after enough valid SQW observations have produced a sane fit. */
 bool rtc_discipline_is_locked(void);
+
+/* v6.17 diagnostic-safe SQW trace. The ISR records only its already-captured
+ * raw local timestamp plus core id. No refresh/network metadata is sampled and
+ * no diagnostic GPIO is driven from the SQW path. */
+void rtc_discipline_dump_sqw_trace(void);
+
 
 #ifdef __cplusplus
 }

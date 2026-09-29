@@ -30,6 +30,9 @@
 #include "freertos/task.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
+#include "lwip/pbuf.h"
+#include "lwip/prot/ip4.h"
+#include "lwip/prot/udp.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 
@@ -60,6 +63,25 @@
 #endif
 #endif
 
+#if defined(CONFIG_FACTORY_DISPLAY_REFRESH_EDGE_DIAGNOSTICS) && CONFIG_FACTORY_DISPLAY_REFRESH_EDGE_DIAGNOSTICS
+#if CONFIG_FACTORY_DISPLAY_REFRESH_EDGE_GPIO == CONFIG_FACTORY_DISPLAY_EDGE_GPIO
+#error "Refresh adoption marker GPIO must not overlap display commit marker GPIO"
+#endif
+#if defined(CONFIG_FACTORY_START_EDGE_DIAGNOSTICS) && CONFIG_FACTORY_START_EDGE_DIAGNOSTICS
+#if CONFIG_FACTORY_DISPLAY_REFRESH_EDGE_GPIO == CONFIG_FACTORY_START_EDGE_GPIO
+#error "Refresh adoption marker GPIO must not overlap START diagnostic GPIO"
+#endif
+#endif
+#if defined(CONFIG_FACTORY_DS3231_DISCIPLINE) && CONFIG_FACTORY_DS3231_DISCIPLINE
+#if CONFIG_FACTORY_DISPLAY_REFRESH_EDGE_GPIO == DS3231_SDA_PIN || CONFIG_FACTORY_DISPLAY_REFRESH_EDGE_GPIO == DS3231_SCL_PIN
+#error "Refresh adoption marker GPIO must not overlap DS3231 I2C"
+#endif
+#if CONFIG_FACTORY_DISPLAY_REFRESH_EDGE_GPIO == CONFIG_FACTORY_DS3231_SQW_GPIO
+#error "Refresh adoption marker GPIO must not overlap DS3231 SQW"
+#endif
+#endif
+#endif
+
 namespace {
 
 constexpr char kTag[] = "factory_timer";
@@ -77,6 +99,11 @@ constexpr int64_t kSchedulerFineLeadUs = 2000;
 constexpr int64_t kFreeRtosTickUs = 1000000LL / configTICK_RATE_HZ;
 constexpr int64_t kExperimentalDelayFineLeadUs = 2000;
 constexpr int64_t kRxBoundaryTraceWindowUs = 15000;
+constexpr size_t kRxBoundaryTraceCapacity = 64;
+constexpr size_t kStatusPathTraceCapacity = 64;
+constexpr size_t kStatusTxTraceCapacity = 128;
+constexpr size_t kSyncReplyTraceCapacity = 64;
+constexpr size_t kEarlyIngressCapacity = 128;
 
 EventGroupHandle_t wifi_event_group;
 esp_netif_t *wifi_sta_netif = nullptr;
@@ -87,10 +114,6 @@ factory_timer::CountdownTimer countdown;
 SemaphoreHandle_t countdown_mutex = nullptr;
 QueueHandle_t timer_event_queue = nullptr;
 TaskHandle_t timer_task_handle = nullptr;
-#if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
-QueueHandle_t rx_boundary_event_queue = nullptr;
-std::atomic<uint32_t> rx_boundary_queue_drops{0};
-#endif
 ds3231_dev_t ds3231_device{};
 bool rtc_discipline_ready = false;
 
@@ -139,6 +162,144 @@ struct TimerStartEvent {
     int64_t sync_estimated_master_us{};
 };
 
+struct StatusSendTiming {
+    int64_t send_status_begin_us{};
+    int64_t wifi_diag_begin_us{};
+    int64_t wifi_diag_end_us{};
+    int64_t rtc_state_begin_us{};
+    int64_t rtc_state_end_us{};
+    int64_t format_done_us{};
+    int64_t sendto_entry_us{};
+    int64_t sendto_return_us{};
+    int64_t send_status_end_us{};
+};
+
+struct EarlyIngressRecord {
+    int64_t ip_input_us{};
+    uint32_t source_address{};
+    uint16_t source_port{};
+    uint16_t destination_port{};
+    uint16_t payload_length{};
+    uint64_t payload_fingerprint{};
+    uint32_t sequence{};
+    bool consumed{};
+};
+
+EarlyIngressRecord early_ingress_ring[kEarlyIngressCapacity]{};
+portMUX_TYPE early_ingress_mux = portMUX_INITIALIZER_UNLOCKED;
+uint32_t early_ingress_write_count = 0;
+uint32_t early_ingress_overwrites = 0;
+
+constexpr uint64_t kIngressFnvOffsetBasis = 14695981039346656037ULL;
+constexpr uint64_t kIngressFnvPrime = 1099511628211ULL;
+
+uint64_t PayloadFingerprint(const void *data, size_t length) {
+    const auto *bytes = static_cast<const uint8_t *>(data);
+    uint64_t hash = kIngressFnvOffsetBasis;
+    for (size_t i = 0; i < length; ++i) {
+        hash ^= bytes[i];
+        hash *= kIngressFnvPrime;
+    }
+    return hash;
+}
+
+uint64_t PbufPayloadFingerprint(const struct pbuf *p, uint16_t offset, uint16_t length) {
+    uint64_t hash = kIngressFnvOffsetBasis;
+    uint8_t chunk[32];
+    uint16_t copied_total = 0;
+    while (copied_total < length) {
+        const uint16_t want = static_cast<uint16_t>(
+            ((length - copied_total) < sizeof(chunk)) ? (length - copied_total) : sizeof(chunk));
+        const u16_t copied = pbuf_copy_partial(
+            p, chunk, want, static_cast<u16_t>(offset + copied_total));
+        if (copied != want) return 0;
+        for (uint16_t i = 0; i < want; ++i) {
+            hash ^= chunk[i];
+            hash *= kIngressFnvPrime;
+        }
+        copied_total = static_cast<uint16_t>(copied_total + want);
+    }
+    return hash;
+}
+
+void RecordEarlyIngress(int64_t ip_input_us, uint32_t source_address,
+                        uint16_t source_port, uint16_t destination_port,
+                        uint16_t payload_length, uint64_t payload_fingerprint) {
+    portENTER_CRITICAL(&early_ingress_mux);
+    const uint32_t sequence = ++early_ingress_write_count;
+    const size_t index = (sequence - 1u) % kEarlyIngressCapacity;
+    if (sequence > kEarlyIngressCapacity && !early_ingress_ring[index].consumed) {
+        ++early_ingress_overwrites;
+    }
+    EarlyIngressRecord record{};
+    record.ip_input_us = ip_input_us;
+    record.source_address = source_address;
+    record.source_port = source_port;
+    record.destination_port = destination_port;
+    record.payload_length = payload_length;
+    record.payload_fingerprint = payload_fingerprint;
+    record.sequence = sequence;
+    record.consumed = false;
+    early_ingress_ring[index] = record;
+    portEXIT_CRITICAL(&early_ingress_mux);
+}
+
+int64_t MatchEarlyIngress(const sockaddr_in &peer, const void *payload, int received_bytes,
+                          uint32_t *matched_sequence = nullptr) {
+    if (payload == nullptr || received_bytes <= 0) return -1;
+    const uint64_t payload_fingerprint =
+        PayloadFingerprint(payload, static_cast<size_t>(received_bytes));
+    int64_t result = -1;
+    uint32_t best_sequence = UINT32_MAX;
+    portENTER_CRITICAL(&early_ingress_mux);
+    for (size_t i = 0; i < kEarlyIngressCapacity; ++i) {
+        EarlyIngressRecord &r = early_ingress_ring[i];
+        if (r.sequence == 0 || r.consumed ||
+            r.source_address != peer.sin_addr.s_addr ||
+            r.source_port != ntohs(peer.sin_port) ||
+            r.destination_port != kCommandPort ||
+            r.payload_length != static_cast<uint16_t>(received_bytes) ||
+            r.payload_fingerprint != payload_fingerprint) {
+            continue;
+        }
+        if (r.sequence < best_sequence) {
+            best_sequence = r.sequence;
+            result = r.ip_input_us;
+        }
+    }
+    if (best_sequence != UINT32_MAX) {
+        const size_t index = (best_sequence - 1u) % kEarlyIngressCapacity;
+        if (early_ingress_ring[index].sequence == best_sequence) {
+            early_ingress_ring[index].consumed = true;
+        }
+        if (matched_sequence != nullptr) *matched_sequence = best_sequence;
+    }
+    portEXIT_CRITICAL(&early_ingress_mux);
+    return result;
+}
+
+struct SyncReplyTraceRecord {
+    uint64_t sync_id{};
+    int64_t master_t1_us{};
+    int64_t ip_input_us{-1};
+    int64_t local_t2_us{};
+    int64_t local_t3_us{};
+    int64_t format_done_us{};
+    int64_t sendto_entry_us{};
+    int64_t sendto_return_us{};
+    uint32_t requested_delay_us{};
+    uint32_t reported_hold_us{};
+    uint16_t packet_length{};
+    bool sent{};
+    bool selected_by_sync_set{};
+    bool t3_late_patch{};
+};
+
+SyncReplyTraceRecord sync_reply_trace[kSyncReplyTraceCapacity]{};
+size_t sync_reply_trace_count = 0;
+bool sync_reply_trace_overflow = false;
+uint64_t sync_reply_trace_sync_id = 0;
+
 #if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
 struct RxBoundaryEvent {
     int64_t receive_local_us{};
@@ -151,6 +312,54 @@ struct RxBoundaryEvent {
     factory_timer::MasterPacketType packet_type{};
     factory_timer::CommandType command_type{};
 };
+
+enum class StatusSendReason : uint8_t {
+    RequestReply,
+    TimerStarted,
+    StateChange,
+    Heartbeat,
+    Other,
+};
+
+struct StatusPathTraceRecord {
+    uint64_t command_id{};
+    uint32_t source_address{};
+    uint16_t source_port{};
+    int64_t ip_input_us{-1};
+    int64_t recv_return_us{};
+    int64_t parse_done_us{};
+    int64_t rx_trace_begin_us{};
+    int64_t rx_trace_end_us{};
+    int64_t lock_request_us{};
+    int64_t lock_acquired_us{};
+    int64_t discipline_begin_us{};
+    int64_t discipline_end_us{};
+    int64_t process_done_us{};
+    int64_t lock_release_us{};
+    int64_t handler_exit_us{};
+    int64_t receive_disciplined_us{};
+    uint32_t boundary_index{};
+    int32_t lead_us{};
+    factory_timer::TimerState snapshot_state{factory_timer::TimerState::Ready};
+    StatusSendTiming send{};
+};
+
+RxBoundaryEvent rx_boundary_trace[kRxBoundaryTraceCapacity]{};
+size_t rx_boundary_trace_count = 0;
+bool rx_boundary_trace_overflow = false;
+struct StatusTxTraceRecord {
+    StatusSendReason reason{StatusSendReason::Other};
+    factory_timer::TimerState state{factory_timer::TimerState::Ready};
+    uint32_t remaining_seconds{};
+    StatusSendTiming send{};
+};
+
+StatusPathTraceRecord status_path_trace[kStatusPathTraceCapacity]{};
+size_t status_path_trace_count = 0;
+bool status_path_trace_overflow = false;
+StatusTxTraceRecord status_tx_trace[kStatusTxTraceCapacity]{};
+size_t status_tx_trace_count = 0;
+bool status_tx_trace_overflow = false;
 #endif
 
 ScheduledStartMetadata scheduled_start_metadata;
@@ -283,7 +492,7 @@ void RtcQualificationTask(void *) {
         rtc_discipline_get_status(&status);
 
         ESP_LOGI(kTag,
-                 "RTC_QUAL device=%s local_us=%lld disciplined_us=%lld state=%s rate_ppm=%+.6f rms_us=%.3f points=%u accepted=%llu rejected=%llu inferred_missing=%llu queue_drops=%u temp_valid=%u temp_c=%.2f",
+                 "RTC_QUAL device=%s local_us=%lld disciplined_us=%lld state=%s rate_ppm=%+.6f rms_us=%.3f points=%u accepted=%llu rejected=%llu inferred_missing=%llu queue_drops=%u temp_valid=%u temp_c=%.2f sqw_core=%d sqw_n=%u sqw_last_period_us=%lld sqw_period_mean_us=%.3f sqw_period_rms_us=%.3f sqw_period_p2p_us=%.3f sqw_trace_n=%u sqw_trace_overwrites=%u",
                  CONFIG_FACTORY_DEVICE_ID,
                  static_cast<long long>(local_us),
                  static_cast<long long>(disciplined_us),
@@ -298,7 +507,15 @@ void RtcQualificationTask(void *) {
                  status.rtc_temperature_valid ? 1u : 0u,
                  status.rtc_temperature_valid
                      ? static_cast<double>(status.rtc_temperature_c)
-                     : 0.0);
+                     : 0.0,
+                 static_cast<int>(status.sqw_isr_core_id),
+                 static_cast<unsigned>(status.sqw_interval_samples),
+                 static_cast<long long>(status.sqw_last_interval_us),
+                 status.sqw_interval_mean_us,
+                 status.sqw_interval_rms_jitter_us,
+                 status.sqw_interval_p2p_us,
+                 static_cast<unsigned>(status.sqw_trace_samples),
+                 static_cast<unsigned>(status.sqw_trace_overwrites));
     }
 }
 #endif
@@ -327,7 +544,7 @@ void WifiEventHandler(void *, esp_event_base_t event_base, int32_t event_id,
             const uint32_t attempt = rejected_network_count.fetch_add(1) + 1;
             ESP_LOGW(kTag,
                      "Rejected DHCP lease: ip=" IPSTR " mask=" IPSTR " gw=" IPSTR
-                     "; expected 192.168.0.0/16 with gateway 192.168.0.1 (attempt=%u)",
+                     "; expected 192.168.0.0/24 with gateway 192.168.0.1 (attempt=%u)",
                      IP2STR(&event->ip_info.ip), IP2STR(&event->ip_info.netmask),
                      IP2STR(&event->ip_info.gw), static_cast<unsigned>(attempt));
             ESP_LOGW(kTag,
@@ -395,14 +612,20 @@ void InitialiseWifi() {
 }
 
 bool SendPacket(int socket_fd, const sockaddr_in &peer, const char *packet,
-                int length, const char *description) {
+                int length, const char *description,
+                int64_t *sendto_entry_us = nullptr,
+                int64_t *sendto_return_us = nullptr) {
     if (length <= 0 ||
         static_cast<std::size_t>(length) > factory_timer::kMaxPacketLength) {
         ESP_LOGE(kTag, "Could not format %s packet", description);
         return false;
     }
+    const int64_t entry_us = esp_timer_get_time();
+    if (sendto_entry_us != nullptr) *sendto_entry_us = entry_us;
     const int sent = sendto(socket_fd, packet, length, 0,
                             reinterpret_cast<const sockaddr *>(&peer), sizeof(peer));
+    const int64_t return_us = esp_timer_get_time();
+    if (sendto_return_us != nullptr) *sendto_return_us = return_us;
     if (sent != length) {
         ESP_LOGW(kTag, "%s transmission failed: errno=%d", description, errno);
         return false;
@@ -435,7 +658,8 @@ struct WifiDiagnostics {
 WifiDiagnostics ReadWifiDiagnostics() {
     WifiDiagnostics diagnostics{};
     wifi_ap_record_t ap{};
-    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) {
+    const esp_err_t ap_result = esp_wifi_sta_get_ap_info(&ap);
+    if (ap_result != ESP_OK) {
         return diagnostics;
     }
 
@@ -473,15 +697,26 @@ bool RtcRunGateLocked() {
 }
 
 void SendStatus(int socket_fd, const sockaddr_in &peer,
-                const factory_timer::TimerSnapshot &snapshot) {
+                const factory_timer::TimerSnapshot &snapshot,
+                StatusSendTiming *timing = nullptr) {
+    if (timing != nullptr) timing->send_status_begin_us = esp_timer_get_time();
+    if (timing != nullptr) timing->wifi_diag_begin_us = esp_timer_get_time();
     const WifiDiagnostics diagnostics = ReadWifiDiagnostics();
+    if (timing != nullptr) timing->wifi_diag_end_us = esp_timer_get_time();
+    if (timing != nullptr) timing->rtc_state_begin_us = esp_timer_get_time();
+    const char *rtc_state = CurrentRtcDisciplineStateName();
+    if (timing != nullptr) timing->rtc_state_end_us = esp_timer_get_time();
     char packet[factory_timer::kMaxPacketLength + 1]{};
     const int length = factory_timer::FormatStatus(
         packet, sizeof(packet), CONFIG_FACTORY_DEVICE_ID,
         snapshot.last_command_id, snapshot.state, snapshot.remaining_seconds,
         diagnostics.rssi_dbm, diagnostics.channel, diagnostics.bssid,
-        CurrentRtcDisciplineStateName());
-    SendPacket(socket_fd, peer, packet, length, "STATUS");
+        rtc_state);
+    if (timing != nullptr) timing->format_done_us = esp_timer_get_time();
+    SendPacket(socket_fd, peer, packet, length, "STATUS",
+               timing != nullptr ? &timing->sendto_entry_us : nullptr,
+               timing != nullptr ? &timing->sendto_return_us : nullptr);
+    if (timing != nullptr) timing->send_status_end_us = esp_timer_get_time();
 }
 
 #if defined(CONFIG_FACTORY_START_EDGE_DIAGNOSTICS) && CONFIG_FACTORY_START_EDGE_DIAGNOSTICS
@@ -571,71 +806,151 @@ bool ReadDieTemperatureMilliCelsius(int32_t &temperature_milli_c) {
 #endif
 }
 
+void NoteSyncReplySession(uint64_t sync_id) {
+    // v6.15 deliberately retains all foreground/shadow/verification samples
+    // instead of resetting the trace every time the controller changes sync_id.
+    sync_reply_trace_sync_id = sync_id;
+}
+
+void QueueSyncReplyTrace(const SyncReplyTraceRecord &record) {
+    if (sync_reply_trace_count >= kSyncReplyTraceCapacity) {
+        sync_reply_trace_overflow = true;
+        return;
+    }
+    sync_reply_trace[sync_reply_trace_count++] = record;
+}
+
+void DumpSyncReplyTrace() {
+    if (sync_reply_trace_count == 0) return;
+    ESP_LOGI(kTag,
+             "SYNC_REPLY_TRACE_BEGIN sync=%016llX count=%u capacity=%u overflow=%u",
+             static_cast<unsigned long long>(sync_reply_trace_sync_id),
+             static_cast<unsigned>(sync_reply_trace_count),
+             static_cast<unsigned>(kSyncReplyTraceCapacity),
+             sync_reply_trace_overflow ? 1u : 0u);
+    for (size_t i = 0; i < sync_reply_trace_count; ++i) {
+        const SyncReplyTraceRecord &r = sync_reply_trace[i];
+        ESP_LOGI(kTag,
+                 "SYNC_REPLY_TRACE sample=%u sync=%016llX selected=%u t3_late_patch=%u t1_master_us=%lld ip_input_us=%lld ip_input_to_t2_us=%lld t2_local_us=%lld t3_local_us=%lld t3_minus_t2_us=%lld format_done_us=%lld t3_to_sendto_entry_us=%lld sendto_entry_us=%lld sendto_return_us=%lld sendto_duration_us=%lld t3_to_sendto_return_us=%lld requested_delay_us=%u reported_hold_us=%u bytes=%u sent=%u",
+                 static_cast<unsigned>(i + 1),
+                 static_cast<unsigned long long>(r.sync_id),
+                 r.selected_by_sync_set ? 1u : 0u,
+                 r.t3_late_patch ? 1u : 0u,
+                 static_cast<long long>(r.master_t1_us),
+                 static_cast<long long>(r.ip_input_us),
+                 static_cast<long long>(r.ip_input_us >= 0 ? r.local_t2_us - r.ip_input_us : -1),
+                 static_cast<long long>(r.local_t2_us),
+                 static_cast<long long>(r.local_t3_us),
+                 static_cast<long long>(r.local_t3_us - r.local_t2_us),
+                 static_cast<long long>(r.format_done_us),
+                 static_cast<long long>(r.sendto_entry_us - r.local_t3_us),
+                 static_cast<long long>(r.sendto_entry_us),
+                 static_cast<long long>(r.sendto_return_us),
+                 static_cast<long long>(r.sendto_return_us - r.sendto_entry_us),
+                 static_cast<long long>(r.sendto_return_us - r.local_t3_us),
+                 static_cast<unsigned>(r.requested_delay_us),
+                 static_cast<unsigned>(r.reported_hold_us),
+                 static_cast<unsigned>(r.packet_length),
+                 r.sent ? 1u : 0u);
+    }
+    ESP_LOGI(kTag, "SYNC_REPLY_TRACE_END");
+    sync_reply_trace_count = 0;
+    sync_reply_trace_overflow = false;
+    sync_reply_trace_sync_id = 0;
+}
+
 void SendSyncReply(int socket_fd, const sockaddr_in &peer,
                    const factory_timer::SyncRequestPacket &request,
-                   int64_t local_t2_us) {
-    // Temperature telemetry is BG-1 opt-in. Read it before t3 so conversion time
-    // is inside the device-processing interval (t3-t2) and therefore cancels
-    // from the NTP-style network RTT. Foreground timing/control packets do not
-    // request it and keep their established timing/packet shape.
+                   int64_t ip_input_us, int64_t local_t2_us) {
+    NoteSyncReplySession(request.sync_id);
     int32_t die_temperature_milli_c = 0;
     const bool have_die_temperature =
         request.request_die_temperature &&
         ReadDieTemperatureMilliCelsius(die_temperature_milli_c);
 
-    // t3 is intentionally captured BEFORE the optional test delay. This makes
-    // all firmware-side hold time after t3 appear in (t4 - t3), exactly like
-    // reverse-path network latency.
-    const int64_t local_t3_us = esp_timer_get_time();
-    const uint32_t busy_wait_us =
-        WaitExperimentalReplyDelayUs(request.artificial_reply_delay_us);
-
     char packet[factory_timer::kMaxPacketLength + 1]{};
+    int length = -1;
+    int64_t local_t3_us = 0;
+    int64_t format_done_us = 0;
+    uint32_t reported_hold_us = 0;
+    bool t3_late_patch = false;
 
-    // First format pass is intentional for experimental delayed replies: it
-    // lets ActualReverseDelayUs include the normal packet-formatting work that
-    // occurs after t3. A second final format inserts that measured hold value.
-    // The final format/send interval is necessarily not self-reportable inside
-    // the packet itself; the host-side CAL-vs-VER reverse-path check detects
-    // any residual/unreported hold outside this measurement.
-    int length = factory_timer::FormatSyncReply(
-        packet, sizeof(packet), CONFIG_FACTORY_DEVICE_ID, request.sync_id,
-        request.master_t1_us, local_t2_us, local_t3_us, busy_wait_us,
-        have_die_temperature, die_temperature_milli_c);
-
-    uint32_t reported_hold_us = busy_wait_us;
-    if (request.artificial_reply_delay_us > 0) {
-        const int64_t held_us_64 = esp_timer_get_time() - local_t3_us;
-        if (held_us_64 <= 0) {
-            reported_hold_us = 0;
-        } else if (held_us_64 > UINT32_MAX) {
-            reported_hold_us = UINT32_MAX;
+    if (request.artificial_reply_delay_us == 0) {
+        // Pre-build the ordinary reply with a fixed-width T3 placeholder. T3 is
+        // then sampled and patched immediately before sendto(), removing the
+        // ~0.3 ms packet-formatting interval from the reverse-leg timestamp.
+        // Leading decimal zeroes preserve the existing numeric protocol.
+        const char *suffix_format = have_die_temperature ? "|0|%ld" : "";
+        if (have_die_temperature) {
+            length = std::snprintf(packet, sizeof(packet),
+                                   "FCT2|SYNC_REPLY|%s|%016llX|%lld|%lld|00000000000000000000|0|%ld",
+                                   CONFIG_FACTORY_DEVICE_ID,
+                                   static_cast<unsigned long long>(request.sync_id),
+                                   static_cast<long long>(request.master_t1_us),
+                                   static_cast<long long>(local_t2_us),
+                                   static_cast<long>(die_temperature_milli_c));
         } else {
-            reported_hold_us = static_cast<uint32_t>(held_us_64);
+            (void)suffix_format;
+            length = std::snprintf(packet, sizeof(packet),
+                                   "FCT2|SYNC_REPLY|%s|%016llX|%lld|%lld|00000000000000000000",
+                                   CONFIG_FACTORY_DEVICE_ID,
+                                   static_cast<unsigned long long>(request.sync_id),
+                                   static_cast<long long>(request.master_t1_us),
+                                   static_cast<long long>(local_t2_us));
         }
-
+        format_done_us = esp_timer_get_time();
+        char *placeholder = std::strstr(packet, "|00000000000000000000");
+        local_t3_us = esp_timer_get_time();
+        if (placeholder != nullptr) {
+            char t3_fixed[21]{};
+            const int n = std::snprintf(t3_fixed, sizeof(t3_fixed), "%020lld",
+                                        static_cast<long long>(local_t3_us));
+            if (n == 20) {
+                std::memcpy(placeholder + 1, t3_fixed, 20);
+                t3_late_patch = true;
+            }
+        }
+    } else {
+        // Positive-control path keeps the established semantics: T3 precedes
+        // the intentional hold so the injected reverse delay remains visible.
+        local_t3_us = esp_timer_get_time();
+        const uint32_t busy_wait_us =
+            WaitExperimentalReplyDelayUs(request.artificial_reply_delay_us);
+        length = factory_timer::FormatSyncReply(
+            packet, sizeof(packet), CONFIG_FACTORY_DEVICE_ID, request.sync_id,
+            request.master_t1_us, local_t2_us, local_t3_us, busy_wait_us,
+            have_die_temperature, die_temperature_milli_c);
+        const int64_t held_us_64 = esp_timer_get_time() - local_t3_us;
+        if (held_us_64 <= 0) reported_hold_us = 0;
+        else if (held_us_64 > UINT32_MAX) reported_hold_us = UINT32_MAX;
+        else reported_hold_us = static_cast<uint32_t>(held_us_64);
         length = factory_timer::FormatSyncReply(
             packet, sizeof(packet), CONFIG_FACTORY_DEVICE_ID, request.sync_id,
             request.master_t1_us, local_t2_us, local_t3_us, reported_hold_us,
             have_die_temperature, die_temperature_milli_c);
+        format_done_us = esp_timer_get_time();
     }
 
-    // Nothing that can block belongs between the final packet construction and
-    // SendPacket(). In particular, UART logging here would silently inflate the
-    // reverse path. Keep the diagnostic AFTER sendto() has accepted the packet.
-    const bool sent = SendPacket(socket_fd, peer, packet, length, "SYNC_REPLY");
+    int64_t sendto_entry_us = 0;
+    int64_t sendto_return_us = 0;
+    const bool sent = SendPacket(socket_fd, peer, packet, length, "SYNC_REPLY",
+                                 &sendto_entry_us, &sendto_return_us);
 
-    if (request.artificial_reply_delay_us > 0) {
-        ESP_LOGI(kTag,
-                 "SYNC experiment reverse-path delay: sync=%016llX requested_us=%u busy_wait_us=%u reported_hold_us=%u overshoot_us=%d sent=%d t3_local_us=%lld",
-                 static_cast<unsigned long long>(request.sync_id),
-                 static_cast<unsigned>(request.artificial_reply_delay_us),
-                 static_cast<unsigned>(busy_wait_us),
-                 static_cast<unsigned>(reported_hold_us),
-                 static_cast<int>(reported_hold_us) - static_cast<int>(request.artificial_reply_delay_us),
-                 sent ? 1 : 0,
-                 static_cast<long long>(local_t3_us));
-    }
+    SyncReplyTraceRecord sync_trace{};
+    sync_trace.sync_id = request.sync_id;
+    sync_trace.master_t1_us = request.master_t1_us;
+    sync_trace.ip_input_us = ip_input_us;
+    sync_trace.local_t2_us = local_t2_us;
+    sync_trace.local_t3_us = local_t3_us;
+    sync_trace.format_done_us = format_done_us;
+    sync_trace.sendto_entry_us = sendto_entry_us;
+    sync_trace.sendto_return_us = sendto_return_us;
+    sync_trace.requested_delay_us = request.artificial_reply_delay_us;
+    sync_trace.reported_hold_us = reported_hold_us;
+    sync_trace.packet_length = length > 0 ? static_cast<uint16_t>(length) : 0U;
+    sync_trace.sent = sent;
+    sync_trace.t3_late_patch = t3_late_patch;
+    QueueSyncReplyTrace(sync_trace);
 }
 
 void SendSyncApplied(int socket_fd, const sockaddr_in &peer,
@@ -833,52 +1148,93 @@ const char *RxBoundaryPacketTypeName(const RxBoundaryEvent &event) {
     return "UNKNOWN";
 }
 
-void RxBoundaryLoggerTask(void *) {
-    RxBoundaryEvent event{};
-    while (true) {
-        if (xQueueReceive(rx_boundary_event_queue, &event, portMAX_DELAY) != pdTRUE) continue;
-        in_addr source{};
-        source.s_addr = event.source_address;
-        char source_ip[INET_ADDRSTRLEN]{};
-        inet_ntoa_r(source, source_ip, sizeof(source_ip));
-        ESP_LOGI(kTag,
-                 "RX_NEAR_BOUNDARY device=%s local_us=%lld disciplined_us=%lld boundary=%u lead_us=%ld source=%s:%u packet=%s queue_drops=%u",
-                 CONFIG_FACTORY_DEVICE_ID,
-                 static_cast<long long>(event.receive_local_us),
-                 static_cast<long long>(event.receive_disciplined_us),
-                 static_cast<unsigned>(event.boundary_index),
-                 static_cast<long>(event.lead_us),
-                 source_ip,
-                 static_cast<unsigned>(event.source_port),
-                 RxBoundaryPacketTypeName(event),
-                 static_cast<unsigned>(rx_boundary_queue_drops.load(std::memory_order_relaxed)));
-    }
+void ResetNetworkTimingDiagnostics() {
+    rx_boundary_trace_count = 0;
+    rx_boundary_trace_overflow = false;
+    status_path_trace_count = 0;
+    status_path_trace_overflow = false;
+    status_tx_trace_count = 0;
+    status_tx_trace_overflow = false;
 }
 
 void InitialiseRxBoundaryTrace() {
-    rx_boundary_event_queue = xQueueCreate(64, sizeof(RxBoundaryEvent));
-    if (rx_boundary_event_queue == nullptr) {
-        ESP_LOGE(kTag, "Could not create RX-boundary trace queue");
-        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
-    }
-    if (xTaskCreatePinnedToCore(&RxBoundaryLoggerTask, "rx_boundary_log", 4096, nullptr,
-                                kRxBoundaryTraceTaskPriority, nullptr,
-                                kControlTaskCore) != pdPASS) {
-        ESP_LOGE(kTag, "Could not create RX-boundary logger task");
-        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
-    }
     ESP_LOGI(kTag,
-             "Control-port RX boundary trace enabled: window_us=%lld logger_priority=%u core=%d",
-             static_cast<long long>(kRxBoundaryTraceWindowUs),
-             static_cast<unsigned>(kRxBoundaryTraceTaskPriority),
-             static_cast<int>(kControlTaskCore));
+             "Control-port RX/status-path trace enabled: window_us=%lld buffered_until_run_end=1",
+             static_cast<long long>(kRxBoundaryTraceWindowUs));
+}
+
+void StoreRxBoundaryEvent(const RxBoundaryEvent &event) {
+    if (rx_boundary_trace_count >= kRxBoundaryTraceCapacity) {
+        rx_boundary_trace_overflow = true;
+        return;
+    }
+    rx_boundary_trace[rx_boundary_trace_count++] = event;
+}
+
+void StoreStatusPathTrace(const StatusPathTraceRecord &event) {
+    if (status_path_trace_count >= kStatusPathTraceCapacity) {
+        status_path_trace_overflow = true;
+        return;
+    }
+    status_path_trace[status_path_trace_count++] = event;
+}
+
+const char *StatusSendReasonName(StatusSendReason reason) {
+    switch (reason) {
+        case StatusSendReason::RequestReply: return "REQUEST_REPLY";
+        case StatusSendReason::TimerStarted: return "TIMER_STARTED";
+        case StatusSendReason::StateChange: return "STATE_CHANGE";
+        case StatusSendReason::Heartbeat: return "HEARTBEAT";
+        case StatusSendReason::Other: return "OTHER";
+    }
+    return "OTHER";
+}
+
+void StoreStatusTxTrace(StatusSendReason reason,
+                        const factory_timer::TimerSnapshot &snapshot,
+                        const StatusSendTiming &timing) {
+    if (snapshot.state != factory_timer::TimerState::Running) return;
+    if (status_tx_trace_count >= kStatusTxTraceCapacity) {
+        status_tx_trace_overflow = true;
+        return;
+    }
+    StatusTxTraceRecord &out = status_tx_trace[status_tx_trace_count++];
+    out.reason = reason;
+    out.state = snapshot.state;
+    out.remaining_seconds = snapshot.remaining_seconds;
+    out.send = timing;
+}
+
+void SendStatusWithTrace(int socket_fd,
+                         const sockaddr_in &peer,
+                         const factory_timer::TimerSnapshot &snapshot,
+                         StatusSendReason reason) {
+    StatusSendTiming timing{};
+    SendStatus(socket_fd, peer, snapshot, &timing);
+    StoreStatusTxTrace(reason, snapshot, timing);
+}
+
+void FillBoundaryPosition(int64_t receive_disciplined_us,
+                          int64_t start_disciplined_us,
+                          uint32_t duration_seconds,
+                          uint32_t *boundary_index,
+                          int32_t *lead_us) {
+    if (boundary_index != nullptr) *boundary_index = 0;
+    if (lead_us != nullptr) *lead_us = 0;
+    if (start_disciplined_us <= 0 || duration_seconds == 0) return;
+    const int64_t elapsed_us = receive_disciplined_us - start_disciplined_us;
+    if (elapsed_us < 0) return;
+    const int64_t completed_seconds = elapsed_us / 1000000LL;
+    const int64_t phase_us = elapsed_us % 1000000LL;
+    const uint32_t next_boundary = static_cast<uint32_t>(completed_seconds + 1);
+    if (next_boundary > duration_seconds) return;
+    if (boundary_index != nullptr) *boundary_index = next_boundary;
+    if (lead_us != nullptr) *lead_us = static_cast<int32_t>(1000000LL - phase_us);
 }
 
 void MaybeQueueRxNearBoundary(int64_t receive_local_us,
                               const sockaddr_in &peer,
                               const factory_timer::MasterPacket *packet) {
-    if (rx_boundary_event_queue == nullptr) return;
-
     factory_timer::TimerSnapshot snapshot{};
     int64_t start_disciplined_us = 0;
     xSemaphoreTake(countdown_mutex, portMAX_DELAY);
@@ -893,22 +1249,20 @@ void MaybeQueueRxNearBoundary(int64_t receive_local_us,
 
     const int64_t receive_disciplined_us =
         rtc_discipline_local_to_disciplined_us(receive_local_us);
-    const int64_t elapsed_us = receive_disciplined_us - start_disciplined_us;
-    if (elapsed_us < 0) return;
-
-    const int64_t completed_seconds = elapsed_us / 1000000LL;
-    const int64_t phase_us = elapsed_us % 1000000LL;
-    const uint32_t next_boundary = static_cast<uint32_t>(completed_seconds + 1);
-    if (next_boundary > snapshot.duration_seconds) return;
-
-    const int64_t lead_us = 1000000LL - phase_us;
-    if (lead_us <= 0 || lead_us > kRxBoundaryTraceWindowUs) return;
+    uint32_t boundary_index = 0;
+    int32_t lead_us = 0;
+    FillBoundaryPosition(receive_disciplined_us,
+                         start_disciplined_us,
+                         snapshot.duration_seconds,
+                         &boundary_index,
+                         &lead_us);
+    if (boundary_index == 0 || lead_us <= 0 || lead_us > kRxBoundaryTraceWindowUs) return;
 
     RxBoundaryEvent event{};
     event.receive_local_us = receive_local_us;
     event.receive_disciplined_us = receive_disciplined_us;
-    event.boundary_index = next_boundary;
-    event.lead_us = static_cast<int32_t>(lead_us);
+    event.boundary_index = boundary_index;
+    event.lead_us = lead_us;
     event.source_address = peer.sin_addr.s_addr;
     event.source_port = ntohs(peer.sin_port);
     event.parsed = packet != nullptr;
@@ -918,14 +1272,107 @@ void MaybeQueueRxNearBoundary(int64_t receive_local_us,
             event.command_type = packet->command.type;
         }
     }
+    StoreRxBoundaryEvent(event);
+}
 
-    if (xQueueSend(rx_boundary_event_queue, &event, 0) != pdTRUE) {
-        rx_boundary_queue_drops.fetch_add(1, std::memory_order_relaxed);
+void DumpNetworkTimingDiagnostics() {
+    ESP_LOGI(kTag,
+             "RX_BOUNDARY_TRACE_BEGIN count=%u capacity=%u overflow=%u",
+             static_cast<unsigned>(rx_boundary_trace_count),
+             static_cast<unsigned>(kRxBoundaryTraceCapacity),
+             rx_boundary_trace_overflow ? 1u : 0u);
+    for (size_t i = 0; i < rx_boundary_trace_count; ++i) {
+        const RxBoundaryEvent &event = rx_boundary_trace[i];
+        in_addr source{};
+        source.s_addr = event.source_address;
+        char source_ip[INET_ADDRSTRLEN]{};
+        inet_ntoa_r(source, source_ip, sizeof(source_ip));
+        ESP_LOGI(kTag,
+                 "RX_NEAR_BOUNDARY device=%s local_us=%lld disciplined_us=%lld boundary=%u lead_us=%ld source=%s:%u packet=%s",
+                 CONFIG_FACTORY_DEVICE_ID,
+                 static_cast<long long>(event.receive_local_us),
+                 static_cast<long long>(event.receive_disciplined_us),
+                 static_cast<unsigned>(event.boundary_index),
+                 static_cast<long>(event.lead_us),
+                 source_ip,
+                 static_cast<unsigned>(event.source_port),
+                 RxBoundaryPacketTypeName(event));
     }
+    ESP_LOGI(kTag, "RX_BOUNDARY_TRACE_END");
+
+    ESP_LOGI(kTag,
+             "STATUS_PATH_TRACE_BEGIN count=%u capacity=%u overflow=%u",
+             static_cast<unsigned>(status_path_trace_count),
+             static_cast<unsigned>(kStatusPathTraceCapacity),
+             status_path_trace_overflow ? 1u : 0u);
+    for (size_t i = 0; i < status_path_trace_count; ++i) {
+        const StatusPathTraceRecord &r = status_path_trace[i];
+        in_addr source{};
+        source.s_addr = r.source_address;
+        char source_ip[INET_ADDRSTRLEN]{};
+        inet_ntoa_r(source, source_ip, sizeof(source_ip));
+        ESP_LOGI(kTag,
+                 "STATUS_PATH command=%016llX source=%s:%u boundary=%u lead_us=%ld ip_input_us=%lld ip_input_to_recv_us=%lld recv_us=%lld parse_done_us=%lld rx_trace_begin_us=%lld rx_trace_end_us=%lld lock_request_us=%lld lock_acquired_us=%lld discipline_begin_us=%lld discipline_end_us=%lld process_done_us=%lld lock_release_us=%lld send_status_begin_us=%lld wifi_begin_us=%lld wifi_end_us=%lld rtc_begin_us=%lld rtc_end_us=%lld format_done_us=%lld sendto_entry_us=%lld sendto_return_us=%lld send_status_end_us=%lld handler_exit_us=%lld state=%s",
+                 static_cast<unsigned long long>(r.command_id),
+                 source_ip,
+                 static_cast<unsigned>(r.source_port),
+                 static_cast<unsigned>(r.boundary_index),
+                 static_cast<long>(r.lead_us),
+                 static_cast<long long>(r.ip_input_us),
+                 static_cast<long long>(r.ip_input_us >= 0 ? r.recv_return_us - r.ip_input_us : -1),
+                 static_cast<long long>(r.recv_return_us),
+                 static_cast<long long>(r.parse_done_us),
+                 static_cast<long long>(r.rx_trace_begin_us),
+                 static_cast<long long>(r.rx_trace_end_us),
+                 static_cast<long long>(r.lock_request_us),
+                 static_cast<long long>(r.lock_acquired_us),
+                 static_cast<long long>(r.discipline_begin_us),
+                 static_cast<long long>(r.discipline_end_us),
+                 static_cast<long long>(r.process_done_us),
+                 static_cast<long long>(r.lock_release_us),
+                 static_cast<long long>(r.send.send_status_begin_us),
+                 static_cast<long long>(r.send.wifi_diag_begin_us),
+                 static_cast<long long>(r.send.wifi_diag_end_us),
+                 static_cast<long long>(r.send.rtc_state_begin_us),
+                 static_cast<long long>(r.send.rtc_state_end_us),
+                 static_cast<long long>(r.send.format_done_us),
+                 static_cast<long long>(r.send.sendto_entry_us),
+                 static_cast<long long>(r.send.sendto_return_us),
+                 static_cast<long long>(r.send.send_status_end_us),
+                 static_cast<long long>(r.handler_exit_us),
+                 factory_timer::TimerStateName(r.snapshot_state));
+    }
+    ESP_LOGI(kTag, "STATUS_PATH_TRACE_END");
+
+    ESP_LOGI(kTag,
+             "STATUS_TX_TRACE_BEGIN count=%u capacity=%u overflow=%u",
+             static_cast<unsigned>(status_tx_trace_count),
+             static_cast<unsigned>(kStatusTxTraceCapacity),
+             status_tx_trace_overflow ? 1u : 0u);
+    for (size_t i = 0; i < status_tx_trace_count; ++i) {
+        const StatusTxTraceRecord &r = status_tx_trace[i];
+        ESP_LOGI(kTag,
+                 "STATUS_TX reason=%s state=%s remaining=%u begin_us=%lld wifi_begin_us=%lld wifi_end_us=%lld rtc_begin_us=%lld rtc_end_us=%lld format_done_us=%lld sendto_entry_us=%lld sendto_return_us=%lld end_us=%lld",
+                 StatusSendReasonName(r.reason),
+                 factory_timer::TimerStateName(r.state),
+                 static_cast<unsigned>(r.remaining_seconds),
+                 static_cast<long long>(r.send.send_status_begin_us),
+                 static_cast<long long>(r.send.wifi_diag_begin_us),
+                 static_cast<long long>(r.send.wifi_diag_end_us),
+                 static_cast<long long>(r.send.rtc_state_begin_us),
+                 static_cast<long long>(r.send.rtc_state_end_us),
+                 static_cast<long long>(r.send.format_done_us),
+                 static_cast<long long>(r.send.sendto_entry_us),
+                 static_cast<long long>(r.send.sendto_return_us),
+                 static_cast<long long>(r.send.send_status_end_us));
+    }
+    ESP_LOGI(kTag, "STATUS_TX_TRACE_END");
 }
 #else
 void InitialiseRxBoundaryTrace() {}
+void ResetNetworkTimingDiagnostics() {}
 void MaybeQueueRxNearBoundary(int64_t, const sockaddr_in &, const factory_timer::MasterPacket *) {}
+void DumpNetworkTimingDiagnostics() {}
 #endif
 
 void InitialiseStartScheduler() {
@@ -1057,6 +1504,8 @@ void CommandTask(void *) {
         const int received = recvfrom(socket_fd, buffer, sizeof(buffer), 0,
                                       reinterpret_cast<sockaddr *>(&peer), &peer_length);
         const int64_t receive_local_us = esp_timer_get_time();
+        const int64_t ip_input_us =
+            received > 0 ? MatchEarlyIngress(peer, buffer, received) : -1;
 
         if (received > 0) {
             if (received > static_cast<int>(factory_timer::kMaxPacketLength)) {
@@ -1070,9 +1519,29 @@ void CommandTask(void *) {
                     ESP_LOGW(kTag, "Discarded invalid packet (%s)",
                              factory_timer::ParseErrorName(parse_error));
                 } else {
+#if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
+                    StatusPathTraceRecord status_trace{};
+                    const bool trace_status_path =
+                        packet.type == factory_timer::MasterPacketType::Command &&
+                        packet.command.type == factory_timer::CommandType::StatusRequest;
+                    if (trace_status_path) {
+                        status_trace.command_id = packet.command.command_id;
+                        status_trace.source_address = peer.sin_addr.s_addr;
+                        status_trace.source_port = ntohs(peer.sin_port);
+                        status_trace.ip_input_us = ip_input_us;
+                        status_trace.recv_return_us = receive_local_us;
+                        status_trace.parse_done_us = esp_timer_get_time();
+                        status_trace.rx_trace_begin_us = esp_timer_get_time();
+                    }
+#endif
                     MaybeQueueRxNearBoundary(receive_local_us, peer, &packet);
+#if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
+                    if (trace_status_path) {
+                        status_trace.rx_trace_end_us = esp_timer_get_time();
+                    }
+#endif
                     if (packet.type == factory_timer::MasterPacketType::SyncRequest) {
-                    SendSyncReply(socket_fd, peer, packet.sync_request, receive_local_us);
+                    SendSyncReply(socket_fd, peer, packet.sync_request, ip_input_us, receive_local_us);
                     FACTORY_DEBUG_LOGI(kTag,
                                        "SYNC id=%016llX t1=%lld t2=%lld artificial_reply_delay_us=%u",
                                        static_cast<unsigned long long>(packet.sync_request.sync_id),
@@ -1080,6 +1549,11 @@ void CommandTask(void *) {
                                        static_cast<long long>(receive_local_us),
                                        static_cast<unsigned>(packet.sync_request.artificial_reply_delay_us));
                 } else if (packet.type == factory_timer::MasterPacketType::SyncSet) {
+                    for (size_t i = 0; i < sync_reply_trace_count; ++i) {
+                        if (sync_reply_trace[i].sync_id == packet.sync_set.sync_id) {
+                            sync_reply_trace[i].selected_by_sync_set = true;
+                        }
+                    }
                     clock_sync.master_minus_local_offset_us =
                         packet.sync_set.master_minus_local_offset_us;
                     clock_sync.best_rtt_us = packet.sync_set.best_rtt_us;
@@ -1162,12 +1636,36 @@ void CommandTask(void *) {
                             local_start_us = command.start_at_master_us -
                                 clock_sync.master_minus_local_offset_us;
                         }
+#if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
+                        if (trace_status_path) status_trace.lock_request_us = esp_timer_get_time();
+#endif
                         xSemaphoreTake(countdown_mutex, portMAX_DELAY);
+#if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
+                        if (trace_status_path) {
+                            status_trace.lock_acquired_us = esp_timer_get_time();
+                            status_trace.discipline_begin_us = esp_timer_get_time();
+                        }
+#endif
                         const int64_t receive_disciplined_us =
                             rtc_discipline_local_to_disciplined_us(receive_local_us);
+#if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
+                        if (trace_status_path) status_trace.discipline_end_us = esp_timer_get_time();
+#endif
                         const auto processing = factory_timer::ProcessCommand(
                             countdown, command, receive_local_us, local_start_us,
                             receive_disciplined_us);
+#if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
+                        if (trace_status_path) {
+                            status_trace.process_done_us = esp_timer_get_time();
+                            status_trace.receive_disciplined_us = receive_disciplined_us;
+                            status_trace.snapshot_state = processing.snapshot.state;
+                            FillBoundaryPosition(receive_disciplined_us,
+                                                 countdown.StartRunningMicroseconds(),
+                                                 processing.snapshot.duration_seconds,
+                                                 &status_trace.boundary_index,
+                                                 &status_trace.lead_us);
+                        }
+#endif
 
                         if (processing.ack_result == factory_timer::AckResult::Accepted) {
                             if (command.type == factory_timer::CommandType::StartAt ||
@@ -1200,6 +1698,7 @@ void CommandTask(void *) {
                                     command.type == factory_timer::CommandType::StartAt
                                         ? clock_sync.estimated_master_apply_us
                                         : 0;
+                                ResetNetworkTimingDiagnostics();
                                 ArmStartTimerLocked(countdown.ScheduledStartMicroseconds());
 #if defined(CONFIG_FACTORY_DISPLAY_TEST) && CONFIG_FACTORY_DISPLAY_TEST
                                 factory_display_arm(countdown.ScheduledStartMicroseconds(),
@@ -1221,12 +1720,29 @@ void CommandTask(void *) {
                             }
                         }
                         xSemaphoreGive(countdown_mutex);
+#if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
+                        if (trace_status_path) status_trace.lock_release_us = esp_timer_get_time();
+#endif
 
                         if (processing.send_ack) {
                             LogAcceptedCommand(command, processing.ack_result, local_start_us);
                             SendAck(socket_fd, peer, command, processing.ack_result);
                         }
-                        SendStatus(socket_fd, peer, processing.snapshot);
+#if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
+                        if (trace_status_path) {
+                            SendStatus(socket_fd, peer, processing.snapshot, &status_trace.send);
+                            StoreStatusTxTrace(StatusSendReason::RequestReply,
+                                               processing.snapshot,
+                                               status_trace.send);
+                            status_trace.handler_exit_us = esp_timer_get_time();
+                            if (processing.snapshot.state == factory_timer::TimerState::Running) {
+                                StoreStatusPathTrace(status_trace);
+                            }
+                        } else
+#endif
+                        {
+                            SendStatus(socket_fd, peer, processing.snapshot);
+                        }
                         last_snapshot = processing.snapshot;
                         last_heartbeat = receive_local_us;
                     }
@@ -1290,7 +1806,12 @@ void CommandTask(void *) {
                             timer_event.target_master_start_us);
             }
             if (timer_event.have_peer) {
+#if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
+                SendStatusWithTrace(socket_fd, timer_event.peer, timer_event.snapshot,
+                                    StatusSendReason::TimerStarted);
+#else
                 SendStatus(socket_fd, timer_event.peer, timer_event.snapshot);
+#endif
             }
 
             xSemaphoreTake(countdown_mutex, portMAX_DELAY);
@@ -1327,18 +1848,64 @@ void CommandTask(void *) {
             } else if (snapshot.state == factory_timer::TimerState::Finished) {
                 ESP_LOGI(kTag, "Countdown finished: command=%016llX",
                          static_cast<unsigned long long>(snapshot.last_command_id));
+                DumpSyncReplyTrace();
+                rtc_discipline_dump_sqw_trace();
+                DumpNetworkTimingDiagnostics();
             }
-            if (have_peer) SendStatus(socket_fd, last_peer, snapshot);
+            if (have_peer) {
+#if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
+                SendStatusWithTrace(socket_fd, last_peer, snapshot, StatusSendReason::StateChange);
+#else
+                SendStatus(socket_fd, last_peer, snapshot);
+#endif
+            }
             last_snapshot = snapshot;
             last_heartbeat = now;
         } else if (have_peer && now - last_heartbeat >= kHeartbeatIntervalUs) {
+#if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
+            SendStatusWithTrace(socket_fd, last_peer, snapshot, StatusSendReason::Heartbeat);
+#else
             SendStatus(socket_fd, last_peer, snapshot);
+#endif
             last_heartbeat = now;
         }
     }
 }
 
 } // namespace
+
+
+extern "C" int factory_timer_lwip_ip4_input_hook(struct pbuf *p, struct netif *inp) {
+    (void)inp;
+    const int64_t ip_input_us = esp_timer_get_time();
+    if (p == nullptr || p->tot_len < (IP_HLEN + UDP_HLEN)) return 0;
+
+    struct ip_hdr iphdr{};
+    if (pbuf_copy_partial(p, &iphdr, sizeof(iphdr), 0) != sizeof(iphdr)) return 0;
+    if (IPH_V(&iphdr) != 4 || IPH_PROTO(&iphdr) != IPPROTO_UDP) return 0;
+    const uint16_t ip_header_len = IPH_HL_BYTES(&iphdr);
+    if (ip_header_len < IP_HLEN || p->tot_len < (uint16_t)(ip_header_len + UDP_HLEN)) return 0;
+
+    struct udp_hdr udphdr{};
+    if (pbuf_copy_partial(p, &udphdr, sizeof(udphdr), ip_header_len) != sizeof(udphdr)) return 0;
+    const uint16_t destination_port = lwip_ntohs(udphdr.dest);
+    if (destination_port != kCommandPort) return 0;
+    const uint16_t udp_length = lwip_ntohs(udphdr.len);
+    if (udp_length < UDP_HLEN) return 0;
+
+    const uint16_t payload_length = (uint16_t)(udp_length - UDP_HLEN);
+    const uint64_t payload_fingerprint =
+        PbufPayloadFingerprint(p, (uint16_t)(ip_header_len + UDP_HLEN), payload_length);
+    if (payload_fingerprint == 0) return 0;
+
+    RecordEarlyIngress(ip_input_us,
+                       iphdr.src.addr,
+                       lwip_ntohs(udphdr.src),
+                       destination_port,
+                       payload_length,
+                       payload_fingerprint);
+    return 0;  // never consume the packet
+}
 
 extern "C" void app_main() {
     if (!ValidConfiguredDeviceId(CONFIG_FACTORY_DEVICE_ID)) {

@@ -15,3 +15,11 @@ idf_component_register(
 )
 
 target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_17)
+
+
+# v6.17 early receive timestamp (payload-fingerprint matched): use the upstream/ESP lwIP IPv4 input hook.
+# The hook only timestamps UDP/5000 packets and always returns 0, so it never
+# consumes or modifies traffic.
+idf_component_get_property(lwip_lib lwip COMPONENT_LIB)
+target_compile_options(${lwip_lib} PRIVATE "-I${CMAKE_CURRENT_LIST_DIR}")
+target_compile_definitions(${lwip_lib} PRIVATE "-DESP_IDF_LWIP_HOOK_FILENAME=\"factory_lwip_hooks.h\"")

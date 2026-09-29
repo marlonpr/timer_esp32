@@ -14,6 +14,10 @@ void factory_display_backend_fill_rect(int x, int y, int width, int height,
                                        uint8_t r, uint8_t g, uint8_t b);
 void factory_display_backend_set_pixel(int x, int y, uint8_t r, uint8_t g, uint8_t b);
 void factory_display_backend_flip(void);
+// Classic ESP32 validation path: publish the already-rendered inactive frame
+// with one aligned active-frame index store from an ISR. S3 keeps its existing
+// task-context flip implementation and does not call this function from ISR.
+void factory_display_backend_publish_prepared_from_isr(void);
 
 #ifdef __cplusplus
 }

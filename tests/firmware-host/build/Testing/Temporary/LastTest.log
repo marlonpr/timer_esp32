@@ -1,0 +1,35 @@
+Start testing: Sep 29 13:50 UTC
+----------------------------------------------------------
+1/2 Testing: factory_timer_core_debug_0
+1/2 Test: factory_timer_core_debug_0
+Command: "/mnt/data/factory_timer_v6_12_inverse_mapping_trace/tests/firmware-host/build/factory_timer_core_debug_0"
+Directory: /mnt/data/factory_timer_v6_12_inverse_mapping_trace/tests/firmware-host/build
+"factory_timer_core_debug_0" start time: Sep 29 13:50 UTC
+Output:
+----------------------------------------------------------
+factory timer host tests passed with CONFIG_FACTORY_DEBUG_LOGS=0
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"factory_timer_core_debug_0" end time: Sep 29 13:50 UTC
+"factory_timer_core_debug_0" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/2 Testing: factory_timer_core_debug_1
+2/2 Test: factory_timer_core_debug_1
+Command: "/mnt/data/factory_timer_v6_12_inverse_mapping_trace/tests/firmware-host/build/factory_timer_core_debug_1"
+Directory: /mnt/data/factory_timer_v6_12_inverse_mapping_trace/tests/firmware-host/build
+"factory_timer_core_debug_1" start time: Sep 29 13:50 UTC
+Output:
+----------------------------------------------------------
+factory timer host tests passed with CONFIG_FACTORY_DEBUG_LOGS=1
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"factory_timer_core_debug_1" end time: Sep 29 13:50 UTC
+"factory_timer_core_debug_1" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Sep 29 13:50 UTC

@@ -10,6 +10,7 @@
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #define TAG "rtc_discipline"
@@ -28,6 +29,9 @@
 #define SQW_INTERVAL_WINDOW 64
 #define SQW_TRACE_CAPACITY 128
 #define FIT_RESIDUAL_MIN_LOCKED_POINTS 3
+#define SQW_ISR_CORE_ID 1
+#define SQW_ISR_INSTALL_TASK_STACK 3072
+#define SQW_ISR_INSTALL_TASK_PRIORITY 10
 
 typedef struct {
     int64_t sequence;
@@ -331,12 +335,16 @@ static void maybe_exclude_previous_timestamp_outlier(int64_t current_sequence,
         (double)(current_local_us - b->local_us) - expected_us_per_second;
     const double threshold_us = (double)CONFIG_FACTORY_RTC_FIT_RESIDUAL_THRESHOLD_US;
 
-    /* A displacement d of the shared center timestamp produces +d on one
-     * interval and -d on the next. A delayed current endpoint or a delayed
-     * previous endpoint affects only one side, so it is not misclassified. */
-    if (fabs(first_interval_residual_us) < threshold_us ||
-        fabs(second_interval_residual_us) < threshold_us ||
-        first_interval_residual_us * second_interval_residual_us >= 0.0) {
+    /* v6.23+: ISR latency can only move the center timestamp later. A delayed
+     * center edge b produces +d on (b-a) and -d on (c-b). The opposite
+     * signature means b looks early relative to its neighbors; that can happen
+     * when neighboring ESP-side timestamps were delayed or when the current fit
+     * was pulled late. Never reject that early center edge as ISR latency.
+     *
+     * Endpoint-only delays still affect only one interval and do not satisfy
+     * both directional conditions below. */
+    if (first_interval_residual_us < threshold_us ||
+        second_interval_residual_us > -threshold_us) {
         return;
     }
 
@@ -662,6 +670,114 @@ static void discipline_task(void *arg)
     }
 }
 
+typedef struct {
+    SemaphoreHandle_t done;
+    esp_err_t result;
+    gpio_num_t sqw_gpio;
+} sqw_isr_install_ctx_t;
+
+static void sqw_isr_install_task(void *arg)
+{
+    sqw_isr_install_ctx_t *ctx = (sqw_isr_install_ctx_t *)arg;
+    if (!ctx) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* GPIO ISR service affinity follows the core on which the interrupt is
+     * allocated. Run this one-shot installer pinned to core 1 so Wi-Fi/core 0
+     * activity cannot directly delay SQW timestamp capture.
+     *
+     * Deliberately keep the service non-IRAM in this build: the ISR posts to a
+     * FreeRTOS queue, and ESP-IDF v6 places most FreeRTOS functions in flash
+     * unless CONFIG_FREERTOS_IN_IRAM is enabled. Core migration and the fit
+     * filter are the two variables under test in v6.23. */
+    const int installer_core = xPortGetCoreID();
+    if (installer_core != SQW_ISR_CORE_ID) {
+        ESP_LOGE(TAG,
+                 "SQW ISR installer ran on unexpected core=%d expected=%d",
+                 installer_core,
+                 SQW_ISR_CORE_ID);
+        ctx->result = ESP_FAIL;
+        xSemaphoreGive(ctx->done);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    esp_err_t err = gpio_install_isr_service(0);
+    if (err == ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG,
+                 "GPIO ISR service was already installed before SQW setup; core-1 affinity cannot be guaranteed");
+        ctx->result = err;
+        xSemaphoreGive(ctx->done);
+        vTaskDelete(NULL);
+        return;
+    }
+    if (err != ESP_OK) {
+        ctx->result = err;
+        xSemaphoreGive(ctx->done);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* Only after the ISR service has been allocated on core 1 do we assign the
+     * SQW edge type. gpio_isr_handler_add() then enables this pin on the CPU
+     * that owns the service handle. */
+    err = gpio_set_intr_type(ctx->sqw_gpio, GPIO_INTR_POSEDGE);
+    if (err != ESP_OK) {
+        gpio_uninstall_isr_service();
+        ctx->result = err;
+        xSemaphoreGive(ctx->done);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    err = gpio_isr_handler_add(ctx->sqw_gpio, sqw_isr, NULL);
+    if (err != ESP_OK) {
+        gpio_uninstall_isr_service();
+    } else {
+        ESP_LOGI(TAG,
+                 "SQW ISR service installed: installer_core=%d requested_core=%d",
+                 installer_core,
+                 SQW_ISR_CORE_ID);
+    }
+    ctx->result = err;
+    xSemaphoreGive(ctx->done);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t install_sqw_isr_on_core1(gpio_num_t sqw_gpio)
+{
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    if (!done) return ESP_ERR_NO_MEM;
+
+    sqw_isr_install_ctx_t ctx = {
+        .done = done,
+        .result = ESP_FAIL,
+        .sqw_gpio = sqw_gpio,
+    };
+
+    TaskHandle_t installer = NULL;
+    const BaseType_t created = xTaskCreatePinnedToCore(
+        sqw_isr_install_task,
+        "rtc_sqw_isr_init",
+        SQW_ISR_INSTALL_TASK_STACK,
+        &ctx,
+        SQW_ISR_INSTALL_TASK_PRIORITY,
+        &installer,
+        SQW_ISR_CORE_ID);
+    if (created != pdPASS) {
+        vSemaphoreDelete(done);
+        return ESP_ERR_NO_MEM;
+    }
+
+    (void)installer;
+    xSemaphoreTake(done, portMAX_DELAY);
+    const esp_err_t result = ctx.result;
+    vSemaphoreDelete(done);
+    return result;
+}
+
 esp_err_t rtc_discipline_init(ds3231_dev_t *rtc,
                               const rtc_discipline_config_t *config)
 {
@@ -720,7 +836,12 @@ esp_err_t rtc_discipline_init(ds3231_dev_t *rtc,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = config->enable_internal_pullup ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_POSEDGE,
+        /* Keep the pin interrupt disabled here. gpio_config() enables a
+         * non-disabled interrupt immediately, and ESP-IDF records the current
+         * CPU as the GPIO interrupt core at that point. rtc_discipline_init()
+         * normally runs on core 0, which defeated the later core-1 installer
+         * in v6.23. The pinned installer below owns the first enable. */
+        .intr_type = GPIO_INTR_DISABLE,
     };
     err = gpio_config(&gpio_cfg);
     if (err != ESP_OK) {
@@ -728,12 +849,7 @@ esp_err_t rtc_discipline_init(ds3231_dev_t *rtc,
     }
 
 
-    err = gpio_install_isr_service(0);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        return err;
-    }
-
-    err = gpio_isr_handler_add(config->sqw_gpio, sqw_isr, NULL);
+    err = install_sqw_isr_on_core1(config->sqw_gpio);
     if (err != ESP_OK) {
         return err;
     }
@@ -750,11 +866,12 @@ esp_err_t rtc_discipline_init(ds3231_dev_t *rtc,
 
     s_ctx.initialized = true;
     ESP_LOGI(TAG,
-             "Started: SQW GPIO=%d acquire_points=%u fit_points=%u holdover_ms=%u",
+             "Started: SQW GPIO=%d acquire_points=%u fit_points=%u holdover_ms=%u isr_core=%d fit_filter=late_only core_affinity_fix=1",
              config->sqw_gpio,
              (unsigned)config->acquire_points,
              (unsigned)config->fit_points,
-             (unsigned)config->holdover_timeout_ms);
+             (unsigned)config->holdover_timeout_ms,
+             SQW_ISR_CORE_ID);
     return ESP_OK;
 }
 

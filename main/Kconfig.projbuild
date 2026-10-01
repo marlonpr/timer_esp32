@@ -96,14 +96,17 @@ config FACTORY_RTC_SQW_CORRELATION_TRACE
 
 
 config FACTORY_RTC_FIT_RESIDUAL_REJECTION
-    bool "Reject isolated SQW timestamp outliers from the rate fit"
+    bool "Reject isolated late SQW timestamp outliers from the rate fit"
     default y
     depends on FACTORY_DS3231_DISCIPLINE
     help
         Keeps a physically accepted 1-Hz edge for liveness/sequence accounting but
-        excludes its timestamp from the rate regression when adjacent intervals
-        show the equal-and-opposite signature of an isolated ESP-side timestamp
-        displacement. This does not alter START scheduling.
+        excludes its timestamp from the rate regression only when adjacent intervals
+        show the directional +d/-d signature of an isolated late ESP-side timestamp.
+        The opposite -d/+d (apparently early center) signature is retained because ISR
+        latency cannot timestamp a physical edge early and rejecting it can capture a
+        fit that was pulled late by neighboring delayed timestamps. This does not alter
+        START scheduling.
 
 config FACTORY_RTC_FIT_RESIDUAL_THRESHOLD_US
     int "SQW fit timestamp residual threshold (microseconds)"
@@ -111,8 +114,9 @@ config FACTORY_RTC_FIT_RESIDUAL_THRESHOLD_US
     default 4
     depends on FACTORY_RTC_FIT_RESIDUAL_REJECTION
     help
-        Minimum magnitude required on both adjacent interval residuals before the
-        shared center timestamp is excluded from the regression. The validated
+        Minimum directional residual required on both adjacent intervals before a
+        late shared center timestamp is excluded from the regression. The first
+        interval must be >= +threshold and the second <= -threshold. The validated
         DS3231 physical edge noise is far below this threshold.
 
 config FACTORY_RX_BOUNDARY_TRACE
@@ -188,8 +192,8 @@ config FACTORY_DISPLAY_REFRESH_EDGE_DIAGNOSTICS
     depends on FACTORY_DISPLAY_EDGE_DIAGNOSTICS && IDF_TARGET_ESP32
     help
         Classic ESP32 validation output. The core-1 HUB75 refresh loop toggles
-        this GPIO when it observes a newly published active frame at the start
-        of a complete scan cycle. This measures publish-to-scan adoption.
+        this GPIO at the exact complete-scan boundary where a pending frame is
+        adopted as active. This measures logical publish-to-visible adoption.
 
 config FACTORY_DISPLAY_REFRESH_EDGE_GPIO
     int "Refresh-side frame-adoption diagnostic GPIO"

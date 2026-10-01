@@ -1,14 +1,12 @@
-v6.22 forward-only START synchronization + disciplined propagation
+v6.23.2 display frame-boundary commit
 
-Production START synchronization changes from v6.21:
-- SYNC_REPLY appends the earliest matched device ingress timestamp (ip_input_us).
-- SYNC_SET may carry the local epoch at which the forward-only offset is defined.
-- Firmware converts that source offset to an equivalent apply-time diagnostic offset.
-- START_AT propagates the offset epoch to T* through the DS3231-disciplined timebase,
-  then converts the disciplined deadline back to raw esp_timer for the deadline task.
+Base firmware: v6.23.1 SQW robustness with DS3231 SQW ISR on core 1 and late-only fit filtering.
+Controller compatibility: v6.22.3 degraded-sync policy (unchanged).
 
-Unchanged:
-- v6.21 RTC START qualification gate.
-- production-silent RUNNING policy.
-- countdown boundary publication / HUB75 timing path.
-- SQW ISR core and symmetric residual filter (SQW changes are intentionally deferred).
+Firmware-only display changes relative to v6.23.1:
+- Exact-second ISR publishes the already-rendered framebuffer as PENDING; it no longer changes the scan-active buffer immediately.
+- Core-1 HUB75 refresh task adopts PENDING only between complete scan cycles.
+- With two framebuffers, rendering waits until that adoption before recycling the previous scan buffer. This closes the race where the old active buffer could be cleared/repainted while the refresh loop was still scanning it.
+- GPIO33 remains the logical countdown-boundary publication marker.
+- GPIO16 remains the physical refresh-boundary adoption marker.
+- DS3231 discipline, SQW core-1 logic, synchronization, START/degraded policy, network-silent RUNNING, fonts, colors, and countdown arithmetic are unchanged.

@@ -1224,10 +1224,10 @@ void DisplayTask(void*) {
 
         DisplayCommand replacement{};
 
-        // START uses the exact same single-index ISR publication path as the
+        // START uses the exact same ISR pending-frame publication path as the
         // subsequent one-second boundaries. The master/TimerTask START path is
-        // unchanged; this timer controls only when the already-rendered first
-        // display frame becomes visible.
+        // unchanged; the refresh task makes the prepared frame visible only at
+        // its next complete HUB75 scan boundary.
         int64_t start_disciplined_us = 0;
         const int64_t fallback_start_disciplined_us =
             rtc_discipline_local_to_disciplined_us(command.local_start_us);
@@ -1564,7 +1564,7 @@ extern "C" bool factory_display_init(const char* device_id, uint8_t brightness) 
         return false;
     }
     ESP_LOGI(kTag,
-             "ISR frame publication enabled: esp_timer_dispatch=ISR prepared_frame_sequence_guard=1 active_frame_publish=single_index");
+             "ISR frame publication enabled: esp_timer_dispatch=ISR prepared_frame_sequence_guard=1 active_frame_publish=pending_refresh_boundary");
 #endif
 
 #if FACTORY_MARKER_GAP_RUNTIME_DIAGNOSTICS

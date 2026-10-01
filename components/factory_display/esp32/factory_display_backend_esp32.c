@@ -56,11 +56,17 @@ static const BaseType_t REFRESH_TASK_CORE = 1;
 static const UBaseType_t REFRESH_TASK_PRIORITY = 20;
 
 static uint8_t framebuffers[2][COLOR_DEPTH][PHY_HEIGHT][PHY_WIDTH];
-// The refresh loop consumes only this aligned 32-bit publication. The inactive
-// frame is always index ^ 1 and is rendered completely before publication.
+// active_frame_index is the buffer that the refresh task is actually scanning.
+// A prepared frame is first published into pending_frame_index. The refresh task
+// adopts that pending frame only between complete HUB75 scan cycles. Keeping
+// "pending" separate from "active" also prevents the renderer from clearing the
+// old scan buffer while core 1 is still consuming it.
 static volatile uint32_t active_frame_index = 0;
-// Render routines call clear() first; that snapshots the inactive frame here so
-// all subsequent pixel writes for one prepared frame target the same buffer.
+static volatile uint32_t pending_frame_index = 0;
+static volatile uint32_t pending_frame_valid = 0;
+// Render routines call clear() first; that waits for any prior pending frame to
+// be adopted, then snapshots the now-safe inactive buffer here. All subsequent
+// pixel writes for one prepared frame target the same buffer.
 static uint32_t render_frame_index = 1;
 static volatile uint8_t global_brightness_pct = 50;
 #if defined(CONFIG_FACTORY_DISPLAY_REFRESH_EDGE_DIAGNOSTICS) && CONFIG_FACTORY_DISPLAY_REFRESH_EDGE_DIAGNOSTICS
@@ -73,6 +79,21 @@ static inline uint32_t load_active_frame_index(void) {
 
 static inline uint32_t inactive_frame_index(void) {
     return load_active_frame_index() ^ 1U;
+}
+
+static void wait_for_pending_frame_adoption(void) {
+    // With two buffers there is no safe render target while one buffer is being
+    // scanned and the other is pending adoption. A full scan is only a few ms;
+    // sleeping one RTOS tick here leaves almost the full one-second preparation
+    // interval while avoiding a core-0 busy spin.
+    while (__atomic_load_n(&pending_frame_valid, __ATOMIC_ACQUIRE) != 0U) {
+        vTaskDelay(1);
+    }
+}
+
+static inline void publish_pending_frame(uint32_t frame_index) {
+    __atomic_store_n(&pending_frame_index, frame_index & 1U, __ATOMIC_RELAXED);
+    __atomic_store_n(&pending_frame_valid, 1U, __ATOMIC_RELEASE);
 }
 
 static inline void IRAM_ATTR direct_gpio_write_level(int gpio_num, bool high) {
@@ -122,20 +143,27 @@ static void refresh_task(void *arg) {
     const int total_cols = PANEL_WIDTH * 2;
 
     uint32_t refresh_frame_index = load_active_frame_index();
-    uint32_t last_adopted_frame_index = refresh_frame_index;
 
     while (1) {
-        refresh_frame_index = load_active_frame_index();
+        // This is the only active-frame adoption point. The previous complete
+        // scan has finished, so switching here guarantees that every row and
+        // bitplane of the next scan comes from one immutable framebuffer.
+        if (__atomic_load_n(&pending_frame_valid, __ATOMIC_ACQUIRE) != 0U) {
+            const uint32_t next =
+                __atomic_load_n(&pending_frame_index, __ATOMIC_RELAXED) & 1U;
+            __atomic_store_n(&active_frame_index, next, __ATOMIC_RELEASE);
+            refresh_frame_index = next;
 #if defined(CONFIG_FACTORY_DISPLAY_REFRESH_EDGE_DIAGNOSTICS) && CONFIG_FACTORY_DISPLAY_REFRESH_EDGE_DIAGNOSTICS
-        if (refresh_frame_index != last_adopted_frame_index) {
             refresh_marker_level ^= 1U;
             direct_gpio_write_level(CONFIG_FACTORY_DISPLAY_REFRESH_EDGE_GPIO,
                                     refresh_marker_level != 0);
-            last_adopted_frame_index = refresh_frame_index;
-        }
-#else
-        last_adopted_frame_index = refresh_frame_index;
 #endif
+            // Release the old scan buffer only after active selection and the
+            // physical adoption marker have committed.
+            __atomic_store_n(&pending_frame_valid, 0U, __ATOMIC_RELEASE);
+        } else {
+            refresh_frame_index = load_active_frame_index();
+        }
 
         for (int plane = 0; plane < COLOR_DEPTH; ++plane) {
             const int weight = 1 << plane;
@@ -195,6 +223,8 @@ static void refresh_task(void *arg) {
 
 bool factory_display_backend_init(uint8_t brightness) {
     active_frame_index = 0;
+    pending_frame_index = 0;
+    pending_frame_valid = 0;
     render_frame_index = 1;
     memset(framebuffers, 0, sizeof(framebuffers));
 
@@ -258,7 +288,7 @@ bool factory_display_backend_init(uint8_t brightness) {
     }
 
     ESP_LOGI(TAG,
-             "ESP32 P5 backend ready: 64x32 four-scan pins R1=2 G1=4 B1=5 R2=18 G2=19 B2=25 A=15 B=26 C=23 LAT=12 OE=14 CLK=13 brightness=%u%% refresh_core=%d refresh_priority=%u",
+             "ESP32 P5 backend ready: 64x32 four-scan pins R1=2 G1=4 B1=5 R2=18 G2=19 B2=25 A=15 B=26 C=23 LAT=12 OE=14 CLK=13 brightness=%u%% refresh_core=%d refresh_priority=%u frame_commit=refresh_boundary",
              (unsigned)global_brightness_pct, (int)REFRESH_TASK_CORE,
              (unsigned)REFRESH_TASK_PRIORITY);
 #if defined(CONFIG_FACTORY_DISPLAY_REFRESH_EDGE_DIAGNOSTICS) && CONFIG_FACTORY_DISPLAY_REFRESH_EDGE_DIAGNOSTICS
@@ -276,6 +306,9 @@ void factory_display_backend_set_brightness_percent(uint8_t brightness_percent) 
 }
 
 void factory_display_backend_clear(void) {
+    // Do not recycle the previous active buffer until core 1 has crossed the
+    // real scan boundary and adopted the pending frame.
+    wait_for_pending_frame_adoption();
     render_frame_index = inactive_frame_index();
     memset(framebuffers[render_frame_index], 0, sizeof(framebuffers[render_frame_index]));
 }
@@ -294,14 +327,17 @@ void factory_display_backend_set_pixel(int x, int y, uint8_t r, uint8_t g, uint8
 }
 
 void factory_display_backend_flip(void) {
-    const uint32_t next = inactive_frame_index();
-    __atomic_store_n(&active_frame_index, next, __ATOMIC_RELEASE);
+    // Task-context publication follows the same boundary handoff as the ISR
+    // path. clear() guarantees that no older pending frame is outstanding.
+    publish_pending_frame(render_frame_index);
 }
 
 void IRAM_ATTR factory_display_backend_publish_prepared_from_isr(void) {
-    // Rendering always targets the inactive frame. Publication is exactly one
-    // aligned 32-bit store observed by the core-1 refresh loop at its next full
-    // scan boundary. No pointer triplet can be seen half-swapped.
-    const uint32_t current = __atomic_load_n(&active_frame_index, __ATOMIC_RELAXED) & 1U;
-    __atomic_store_n(&active_frame_index, current ^ 1U, __ATOMIC_RELEASE);
+    // Do not change active_frame_index here. The exact countdown boundary only
+    // publishes a pending buffer. Core 1 performs the visible adoption after
+    // the current complete HUB75 scan has ended.
+    const uint32_t current =
+        __atomic_load_n(&active_frame_index, __ATOMIC_RELAXED) & 1U;
+    __atomic_store_n(&pending_frame_index, current ^ 1U, __ATOMIC_RELAXED);
+    __atomic_store_n(&pending_frame_valid, 1U, __ATOMIC_RELEASE);
 }

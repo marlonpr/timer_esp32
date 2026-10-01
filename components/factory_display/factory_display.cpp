@@ -53,7 +53,10 @@ constexpr int64_t kRuntimeSnapshotMinimumMarginUs = 1500;
 constexpr size_t kBoundaryTraceCapacity = 64;
 
 #if CONFIG_IDF_TARGET_ESP32
-constexpr size_t kIsrPublishTraceCapacity = 64;
+constexpr size_t kIsrPublishTraceFirstCapacity = 8;
+constexpr size_t kIsrPublishTraceWorstCapacity = 8;
+constexpr size_t kIsrPublishTraceCapacity =
+    kIsrPublishTraceFirstCapacity + kIsrPublishTraceWorstCapacity;
 #if !defined(CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD) || \
     !CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD
 #error "v6.14 ISR frame publication requires CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD=y"
@@ -208,7 +211,9 @@ std::atomic<uint32_t> s_frame_not_ready_count{0};
 std::atomic<uint32_t> s_publish_sequence_counter{0};
 IsrPublishTraceRecord s_isr_last_sample{};
 IsrPublishTraceRecord s_isr_publish_trace[kIsrPublishTraceCapacity]{};
-size_t s_isr_publish_trace_count = 0;
+size_t s_isr_publish_trace_first_count = 0;
+size_t s_isr_publish_trace_worst_count = 0;
+uint32_t s_isr_publish_trace_total = 0;
 bool s_isr_publish_trace_overflow = false;
 #endif
 
@@ -264,7 +269,9 @@ void IRAM_ATTR TogglePresentationDiagnosticEdgeFromIsr() {
 bool TryReceiveReplacement(DisplayCommand* replacement);
 
 void ResetIsrPublishTrace() {
-    s_isr_publish_trace_count = 0;
+    s_isr_publish_trace_first_count = 0;
+    s_isr_publish_trace_worst_count = 0;
+    s_isr_publish_trace_total = 0;
     s_isr_publish_trace_overflow = false;
     s_prepared_sequence.store(0, std::memory_order_release);
     s_scheduled_sequence.store(0, std::memory_order_release);
@@ -407,16 +414,46 @@ bool WaitForBoundaryPublishOrReplacement(uint32_t sequence,
     }
 }
 
+int64_t IsrPublishCallbackLateness(const IsrPublishTraceRecord& r) {
+    return r.callback_entry_us - r.target_local_us;
+}
+
+void RetainIsrPublishTraceRecord(const IsrPublishTraceRecord& sample) {
+    s_isr_publish_trace_total++;
+
+    if (s_isr_publish_trace_first_count < kIsrPublishTraceFirstCapacity) {
+        s_isr_publish_trace[s_isr_publish_trace_first_count++] = sample;
+        return;
+    }
+
+    const size_t worst_base = kIsrPublishTraceFirstCapacity;
+    if (s_isr_publish_trace_worst_count < kIsrPublishTraceWorstCapacity) {
+        s_isr_publish_trace[worst_base + s_isr_publish_trace_worst_count++] = sample;
+        return;
+    }
+
+    s_isr_publish_trace_overflow = true;
+    size_t minimum_slot = worst_base;
+    int64_t minimum_lateness = IsrPublishCallbackLateness(s_isr_publish_trace[minimum_slot]);
+    for (size_t i = 1; i < kIsrPublishTraceWorstCapacity; ++i) {
+        const size_t slot = worst_base + i;
+        const int64_t lateness = IsrPublishCallbackLateness(s_isr_publish_trace[slot]);
+        if (lateness < minimum_lateness) {
+            minimum_lateness = lateness;
+            minimum_slot = slot;
+        }
+    }
+    if (IsrPublishCallbackLateness(sample) > minimum_lateness) {
+        s_isr_publish_trace[minimum_slot] = sample;
+    }
+}
+
 void RecordIsrPublishTrace(uint32_t boundary,
                            uint32_t sequence,
                            int64_t disciplined_us,
                            int64_t target_local_us,
                            int64_t arm_us,
                            int64_t post_local_us) {
-    if (s_isr_publish_trace_count >= kIsrPublishTraceCapacity) {
-        s_isr_publish_trace_overflow = true;
-        return;
-    }
     IsrPublishTraceRecord sample = s_isr_last_sample;
     sample.boundary = boundary;
     sample.sequence = sequence;
@@ -424,39 +461,52 @@ void RecordIsrPublishTrace(uint32_t boundary,
     sample.target_local_us = target_local_us;
     sample.arm_us = arm_us;
     sample.post_local_us = post_local_us;
-    s_isr_publish_trace[s_isr_publish_trace_count++] = sample;
+    RetainIsrPublishTraceRecord(sample);
+}
+
+void LogIsrPublishTraceRecord(const IsrPublishTraceRecord& r, const char* retention) {
+    ESP_LOGI(kTag,
+             "ISR_PUBLISH boundary=%u sequence=%u disciplined_us=%lld target_local_us=%lld arm_us=%lld arm_margin_us=%lld callback_entry_us=%lld callback_lateness_us=%lld publish_marker_begin_us=%lld publish_marker_end_us=%lld publish_marker_us=%lld callback_exit_us=%lld post_local_us=%lld post_minus_target_us=%lld prepared_sequence=%u published_sequence=%u published=%u marker_level=%u frame_not_ready_count=%u retention=%s",
+             static_cast<unsigned>(r.boundary),
+             static_cast<unsigned>(r.sequence),
+             static_cast<long long>(r.disciplined_us),
+             static_cast<long long>(r.target_local_us),
+             static_cast<long long>(r.arm_us),
+             static_cast<long long>(r.target_local_us - r.arm_us),
+             static_cast<long long>(r.callback_entry_us),
+             static_cast<long long>(r.callback_entry_us - r.target_local_us),
+             static_cast<long long>(r.publish_marker_begin_us),
+             static_cast<long long>(r.publish_marker_end_us),
+             static_cast<long long>(r.publish_marker_end_us - r.publish_marker_begin_us),
+             static_cast<long long>(r.callback_exit_us),
+             static_cast<long long>(r.post_local_us),
+             static_cast<long long>(r.post_local_us - r.target_local_us),
+             static_cast<unsigned>(r.prepared_sequence),
+             static_cast<unsigned>(r.published_sequence),
+             r.published ? 1u : 0u,
+             static_cast<unsigned>(r.marker_level),
+             static_cast<unsigned>(r.frame_not_ready_count),
+             retention);
 }
 
 void DumpIsrPublishTrace() {
+    const size_t retained_count =
+        s_isr_publish_trace_first_count + s_isr_publish_trace_worst_count;
     ESP_LOGI(kTag,
-             "ISR_PUBLISH_TRACE_BEGIN count=%u capacity=%u overflow=%u frame_not_ready=%u",
-             static_cast<unsigned>(s_isr_publish_trace_count),
+             "ISR_PUBLISH_TRACE_BEGIN count=%u capacity=%u total=%u first=%u worst=%u overflow=%u frame_not_ready=%u",
+             static_cast<unsigned>(retained_count),
              static_cast<unsigned>(kIsrPublishTraceCapacity),
+             static_cast<unsigned>(s_isr_publish_trace_total),
+             static_cast<unsigned>(s_isr_publish_trace_first_count),
+             static_cast<unsigned>(s_isr_publish_trace_worst_count),
              s_isr_publish_trace_overflow ? 1u : 0u,
              static_cast<unsigned>(s_frame_not_ready_count.load(std::memory_order_relaxed)));
-    for (size_t i = 0; i < s_isr_publish_trace_count; ++i) {
-        const IsrPublishTraceRecord& r = s_isr_publish_trace[i];
-        ESP_LOGI(kTag,
-                 "ISR_PUBLISH boundary=%u sequence=%u disciplined_us=%lld target_local_us=%lld arm_us=%lld arm_margin_us=%lld callback_entry_us=%lld callback_lateness_us=%lld publish_marker_begin_us=%lld publish_marker_end_us=%lld publish_marker_us=%lld callback_exit_us=%lld post_local_us=%lld post_minus_target_us=%lld prepared_sequence=%u published_sequence=%u published=%u marker_level=%u frame_not_ready_count=%u",
-                 static_cast<unsigned>(r.boundary),
-                 static_cast<unsigned>(r.sequence),
-                 static_cast<long long>(r.disciplined_us),
-                 static_cast<long long>(r.target_local_us),
-                 static_cast<long long>(r.arm_us),
-                 static_cast<long long>(r.target_local_us - r.arm_us),
-                 static_cast<long long>(r.callback_entry_us),
-                 static_cast<long long>(r.callback_entry_us - r.target_local_us),
-                 static_cast<long long>(r.publish_marker_begin_us),
-                 static_cast<long long>(r.publish_marker_end_us),
-                 static_cast<long long>(r.publish_marker_end_us - r.publish_marker_begin_us),
-                 static_cast<long long>(r.callback_exit_us),
-                 static_cast<long long>(r.post_local_us),
-                 static_cast<long long>(r.post_local_us - r.target_local_us),
-                 static_cast<unsigned>(r.prepared_sequence),
-                 static_cast<unsigned>(r.published_sequence),
-                 r.published ? 1u : 0u,
-                 static_cast<unsigned>(r.marker_level),
-                 static_cast<unsigned>(r.frame_not_ready_count));
+    for (size_t i = 0; i < s_isr_publish_trace_first_count; ++i) {
+        LogIsrPublishTraceRecord(s_isr_publish_trace[i], "FIRST");
+    }
+    for (size_t i = 0; i < s_isr_publish_trace_worst_count; ++i) {
+        LogIsrPublishTraceRecord(
+            s_isr_publish_trace[kIsrPublishTraceFirstCapacity + i], "WORST");
     }
     ESP_LOGI(kTag, "ISR_PUBLISH_TRACE_END");
 }
@@ -1220,11 +1270,7 @@ void DisplayTask(void*) {
             fallback.marker_level = static_cast<uint8_t>(
                 s_presentation_diagnostic_level.load(std::memory_order_relaxed));
             fallback.published = true;
-            if (s_isr_publish_trace_count < kIsrPublishTraceCapacity) {
-                s_isr_publish_trace[s_isr_publish_trace_count++] = fallback;
-            } else {
-                s_isr_publish_trace_overflow = true;
-            }
+            RetainIsrPublishTraceRecord(fallback);
             commit_lateness_us = end_us - command.local_start_us;
         } else {
             if (!WaitForBoundaryPublishOrReplacement(start_sequence, &replacement)) {
@@ -1340,11 +1386,7 @@ void DisplayTask(void*) {
                 fallback.marker_level = static_cast<uint8_t>(
                     s_presentation_diagnostic_level.load(std::memory_order_relaxed));
                 fallback.published = true;
-                if (s_isr_publish_trace_count < kIsrPublishTraceCapacity) {
-                    s_isr_publish_trace[s_isr_publish_trace_count++] = fallback;
-                } else {
-                    s_isr_publish_trace_overflow = true;
-                }
+                RetainIsrPublishTraceRecord(fallback);
                 worst_boundary_publish_lateness_us = std::max(
                     worst_boundary_publish_lateness_us, fallback_end_us - boundary_local_us);
                 s_prepared_sequence.store(0, std::memory_order_release);

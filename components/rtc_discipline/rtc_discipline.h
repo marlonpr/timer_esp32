@@ -43,6 +43,11 @@ typedef struct {
     rtc_discipline_state_t state;
     uint64_t accepted_edges;
     uint64_t rejected_edges;
+    /* Physically accepted edges whose ESP-side timestamp was excluded from the
+     * rate regression by the isolated-timestamp residual gate. */
+    uint64_t fit_outlier_edges;
+    double fit_last_outlier_residual_us;
+    double fit_max_abs_outlier_residual_us;
     uint64_t inferred_missing_edges;
     uint32_t isr_queue_drops;
     int64_t last_edge_local_us;

@@ -94,6 +94,27 @@ config FACTORY_RTC_SQW_CORRELATION_TRACE
         there is no SQW ISR ring-buffer critical section or trace write. Enable
         only for dedicated instrumentation runs.
 
+
+config FACTORY_RTC_FIT_RESIDUAL_REJECTION
+    bool "Reject isolated SQW timestamp outliers from the rate fit"
+    default y
+    depends on FACTORY_DS3231_DISCIPLINE
+    help
+        Keeps a physically accepted 1-Hz edge for liveness/sequence accounting but
+        excludes its timestamp from the rate regression when adjacent intervals
+        show the equal-and-opposite signature of an isolated ESP-side timestamp
+        displacement. This does not alter START scheduling.
+
+config FACTORY_RTC_FIT_RESIDUAL_THRESHOLD_US
+    int "SQW fit timestamp residual threshold (microseconds)"
+    range 2 50
+    default 4
+    depends on FACTORY_RTC_FIT_RESIDUAL_REJECTION
+    help
+        Minimum magnitude required on both adjacent interval residuals before the
+        shared center timestamp is excluded from the regression. The validated
+        DS3231 physical edge noise is far below this threshold.
+
 config FACTORY_RX_BOUNDARY_TRACE
     bool "Trace control-port RX near display boundaries"
     default y
@@ -104,6 +125,34 @@ config FACTORY_RX_BOUNDARY_TRACE
         cannot create the timing event being measured. This observes port 5000
         traffic only; Wi-Fi management frames and unrelated UDP ports remain
         outside this application-level trace.
+
+
+config FACTORY_POST_RUN_TIMING_DUMP
+    bool "Enable paced asynchronous post-run timing dump"
+    default n
+    help
+        Diagnostic builds only. Copies the buffered timing traces at countdown
+        completion and dumps them from a separate low-priority CPU0 task with a
+        one-tick pause between records. The UDP CommandTask never performs the
+        multi-second UART dump. Leave disabled in production.
+
+config FACTORY_PER_SECOND_STATE_CHANGE_STATUS
+    bool "Send STATE_CHANGE status on every RUNNING second (legacy/diagnostic)"
+    default n
+    help
+        Legacy/diagnostic option. Production v6.20 keeps this disabled so a RUNNING
+        countdown does not emit one unsolicited application status packet per second.
+        Explicit STATUS_REQUEST replies and state-transition telemetry remain active.
+
+config FACTORY_SUPPRESS_RUNNING_HEARTBEAT
+    bool "Keep RUNNING countdown application-status traffic silent"
+    default y
+    help
+        Production v6.20 behavior. Suppresses the normal two-second unsolicited
+        heartbeat while the timer is RUNNING before Wi-Fi queries, RTC reads,
+        status formatting, or sendto occur. Explicit STATUS_REQUEST replies,
+        STARTED/FINISHED telemetry, RESET, and command reception remain active.
+        Heartbeat cadence bookkeeping still advances while suppressed.
 
 endmenu
 

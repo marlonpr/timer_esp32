@@ -94,6 +94,7 @@ constexpr UBaseType_t kTimerTaskPriority = 24;
 constexpr UBaseType_t kCommandTaskPriority = 15;
 constexpr UBaseType_t kRtcQualificationTaskPriority = 5;
 constexpr UBaseType_t kRxBoundaryTraceTaskPriority = 4;
+constexpr UBaseType_t kDiagnosticDumpTaskPriority = 1;
 constexpr BaseType_t kControlTaskCore = 0;
 constexpr int64_t kSchedulerFineLeadUs = 2000;
 constexpr int64_t kFreeRtosTickUs = 1000000LL / configTICK_RATE_HZ;
@@ -110,10 +111,12 @@ esp_netif_t *wifi_sta_netif = nullptr;
 TaskHandle_t dhcp_retry_task_handle = nullptr;
 std::atomic<bool> dhcp_retry_pending{false};
 std::atomic<uint32_t> rejected_network_count{0};
+std::atomic<uint32_t> running_heartbeat_suppressed{0};
 factory_timer::CountdownTimer countdown;
 SemaphoreHandle_t countdown_mutex = nullptr;
 QueueHandle_t timer_event_queue = nullptr;
 TaskHandle_t timer_task_handle = nullptr;
+TaskHandle_t diagnostic_dump_task_handle = nullptr;
 ds3231_dev_t ds3231_device{};
 bool rtc_discipline_ready = false;
 
@@ -129,6 +132,10 @@ struct ClockSyncState {
     uint64_t sync_id{};
     int64_t applied_local_us{};
     int64_t estimated_master_apply_us{};
+    int64_t source_offset_us{};
+    int64_t offset_epoch_local_us{};
+    int64_t offset_epoch_disciplined_us{};
+    int64_t estimated_master_epoch_us{};
 };
 
 ClockSyncState clock_sync;
@@ -144,6 +151,10 @@ struct ScheduledStartMetadata {
     uint64_t best_rtt_us{};
     int64_t sync_applied_local_us{};
     int64_t sync_estimated_master_us{};
+    int64_t source_offset_us{};
+    int64_t offset_epoch_local_us{};
+    int64_t offset_epoch_disciplined_us{};
+    int64_t estimated_master_epoch_us{};
 };
 
 struct TimerStartEvent {
@@ -160,6 +171,10 @@ struct TimerStartEvent {
     uint64_t best_rtt_us{};
     int64_t sync_applied_local_us{};
     int64_t sync_estimated_master_us{};
+    int64_t source_offset_us{};
+    int64_t offset_epoch_local_us{};
+    int64_t offset_epoch_disciplined_us{};
+    int64_t estimated_master_epoch_us{};
 };
 
 struct StatusSendTiming {
@@ -492,7 +507,7 @@ void RtcQualificationTask(void *) {
         rtc_discipline_get_status(&status);
 
         ESP_LOGI(kTag,
-                 "RTC_QUAL device=%s local_us=%lld disciplined_us=%lld state=%s rate_ppm=%+.6f rms_us=%.3f points=%u accepted=%llu rejected=%llu inferred_missing=%llu queue_drops=%u temp_valid=%u temp_c=%.2f sqw_core=%d sqw_n=%u sqw_last_period_us=%lld sqw_period_mean_us=%.3f sqw_period_rms_us=%.3f sqw_period_p2p_us=%.3f sqw_trace_n=%u sqw_trace_overwrites=%u",
+                 "RTC_QUAL device=%s local_us=%lld disciplined_us=%lld state=%s rate_ppm=%+.6f rms_us=%.3f points=%u accepted=%llu rejected=%llu fit_outliers=%llu fit_last_outlier_us=%+.3f fit_max_outlier_us=%.3f inferred_missing=%llu queue_drops=%u temp_valid=%u temp_c=%.2f sqw_core=%d sqw_n=%u sqw_last_period_us=%lld sqw_period_mean_us=%.3f sqw_period_rms_us=%.3f sqw_period_p2p_us=%.3f sqw_trace_n=%u sqw_trace_overwrites=%u",
                  CONFIG_FACTORY_DEVICE_ID,
                  static_cast<long long>(local_us),
                  static_cast<long long>(disciplined_us),
@@ -502,6 +517,9 @@ void RtcQualificationTask(void *) {
                  static_cast<unsigned>(status.fit_point_count),
                  static_cast<unsigned long long>(status.accepted_edges),
                  static_cast<unsigned long long>(status.rejected_edges),
+                 static_cast<unsigned long long>(status.fit_outlier_edges),
+                 status.fit_last_outlier_residual_us,
+                 status.fit_max_abs_outlier_residual_us,
                  static_cast<unsigned long long>(status.inferred_missing_edges),
                  static_cast<unsigned>(status.isr_queue_drops),
                  status.rtc_temperature_valid ? 1u : 0u,
@@ -677,21 +695,53 @@ WifiDiagnostics ReadWifiDiagnostics() {
     return diagnostics;
 }
 
-const char *CurrentRtcDisciplineStateName() {
+constexpr uint16_t kRtcStartMinimumFitPoints = 64;
+constexpr double kRtcStartMaximumFitRmsUs = 3.0;
+
+struct RtcStatusFields {
+    const char *state = "DISABLED";
+    uint16_t fit_points = 0;
+    double fit_rms_us = 0.0;
+    uint32_t queue_drops = 0;
+    bool temperature_valid = false;
+};
+
+RtcStatusFields CurrentRtcStatusFields() {
+    RtcStatusFields fields{};
 #if defined(CONFIG_FACTORY_DS3231_DISCIPLINE) && CONFIG_FACTORY_DS3231_DISCIPLINE
-    if (!rtc_discipline_ready) return "UNINITIALIZED";
+    if (!rtc_discipline_ready) {
+        fields.state = "UNINITIALIZED";
+        return fields;
+    }
     rtc_discipline_status_t status{};
     rtc_discipline_get_status(&status);
-    return rtc_discipline_state_name(status.state);
-#else
-    return "DISABLED";
+    fields.state = rtc_discipline_state_name(status.state);
+    fields.fit_points = status.fit_point_count;
+    fields.fit_rms_us = status.fit_rms_us;
+    fields.queue_drops = status.isr_queue_drops;
+    fields.temperature_valid = status.rtc_temperature_valid;
 #endif
+    return fields;
 }
 
-bool RtcRunGateLocked() {
+const char *CurrentRtcDisciplineStateName() {
+    return CurrentRtcStatusFields().state;
+}
+
+bool RtcRunGateQualified(rtc_discipline_status_t *out_status = nullptr) {
 #if defined(CONFIG_FACTORY_DS3231_DISCIPLINE) && CONFIG_FACTORY_DS3231_DISCIPLINE
-    return rtc_discipline_ready && rtc_discipline_is_locked();
+    if (!rtc_discipline_ready) return false;
+    rtc_discipline_status_t status{};
+    rtc_discipline_get_status(&status);
+    if (out_status != nullptr) *out_status = status;
+    return status.state == RTC_DISCIPLINE_LOCKED &&
+           status.fit_point_count >= kRtcStartMinimumFitPoints &&
+           std::isfinite(status.fit_rms_us) &&
+           status.fit_rms_us <= kRtcStartMaximumFitRmsUs &&
+           status.isr_queue_drops == 0 &&
+           status.rtc_temperature_valid;
 #else
+    (void)out_status;
     return true;
 #endif
 }
@@ -704,14 +754,15 @@ void SendStatus(int socket_fd, const sockaddr_in &peer,
     const WifiDiagnostics diagnostics = ReadWifiDiagnostics();
     if (timing != nullptr) timing->wifi_diag_end_us = esp_timer_get_time();
     if (timing != nullptr) timing->rtc_state_begin_us = esp_timer_get_time();
-    const char *rtc_state = CurrentRtcDisciplineStateName();
+    const RtcStatusFields rtc = CurrentRtcStatusFields();
     if (timing != nullptr) timing->rtc_state_end_us = esp_timer_get_time();
     char packet[factory_timer::kMaxPacketLength + 1]{};
     const int length = factory_timer::FormatStatus(
         packet, sizeof(packet), CONFIG_FACTORY_DEVICE_ID,
         snapshot.last_command_id, snapshot.state, snapshot.remaining_seconds,
         diagnostics.rssi_dbm, diagnostics.channel, diagnostics.bssid,
-        rtc_state);
+        rtc.state, rtc.fit_points, rtc.fit_rms_us, rtc.queue_drops,
+        rtc.temperature_valid);
     if (timing != nullptr) timing->format_done_us = esp_timer_get_time();
     SendPacket(socket_fd, peer, packet, length, "STATUS",
                timing != nullptr ? &timing->sendto_entry_us : nullptr,
@@ -820,6 +871,12 @@ void QueueSyncReplyTrace(const SyncReplyTraceRecord &record) {
     sync_reply_trace[sync_reply_trace_count++] = record;
 }
 
+void DiagnosticDumpPace() {
+#if defined(CONFIG_FACTORY_POST_RUN_TIMING_DUMP) && CONFIG_FACTORY_POST_RUN_TIMING_DUMP
+    vTaskDelay(1);
+#endif
+}
+
 void DumpSyncReplyTrace() {
     if (sync_reply_trace_count == 0) return;
     ESP_LOGI(kTag,
@@ -852,6 +909,7 @@ void DumpSyncReplyTrace() {
                  static_cast<unsigned>(r.reported_hold_us),
                  static_cast<unsigned>(r.packet_length),
                  r.sent ? 1u : 0u);
+        DiagnosticDumpPace();
     }
     ESP_LOGI(kTag, "SYNC_REPLY_TRACE_END");
     sync_reply_trace_count = 0;
@@ -880,23 +938,24 @@ void SendSyncReply(int socket_fd, const sockaddr_in &peer,
         // then sampled and patched immediately before sendto(), removing the
         // ~0.3 ms packet-formatting interval from the reverse-leg timestamp.
         // Leading decimal zeroes preserve the existing numeric protocol.
-        const char *suffix_format = have_die_temperature ? "|0|%ld" : "";
+        const int64_t ingress_local_us = ip_input_us > 0 ? ip_input_us : 0;
         if (have_die_temperature) {
             length = std::snprintf(packet, sizeof(packet),
-                                   "FCT2|SYNC_REPLY|%s|%016llX|%lld|%lld|00000000000000000000|0|%ld",
+                                   "FCT2|SYNC_REPLY|%s|%016llX|%lld|%lld|00000000000000000000|0|%lld|%ld",
                                    CONFIG_FACTORY_DEVICE_ID,
                                    static_cast<unsigned long long>(request.sync_id),
                                    static_cast<long long>(request.master_t1_us),
                                    static_cast<long long>(local_t2_us),
+                                   static_cast<long long>(ingress_local_us),
                                    static_cast<long>(die_temperature_milli_c));
         } else {
-            (void)suffix_format;
             length = std::snprintf(packet, sizeof(packet),
-                                   "FCT2|SYNC_REPLY|%s|%016llX|%lld|%lld|00000000000000000000",
+                                   "FCT2|SYNC_REPLY|%s|%016llX|%lld|%lld|00000000000000000000|0|%lld",
                                    CONFIG_FACTORY_DEVICE_ID,
                                    static_cast<unsigned long long>(request.sync_id),
                                    static_cast<long long>(request.master_t1_us),
-                                   static_cast<long long>(local_t2_us));
+                                   static_cast<long long>(local_t2_us),
+                                   static_cast<long long>(ingress_local_us));
         }
         format_done_us = esp_timer_get_time();
         char *placeholder = std::strstr(packet, "|00000000000000000000");
@@ -918,7 +977,8 @@ void SendSyncReply(int socket_fd, const sockaddr_in &peer,
             WaitExperimentalReplyDelayUs(request.artificial_reply_delay_us);
         length = factory_timer::FormatSyncReply(
             packet, sizeof(packet), CONFIG_FACTORY_DEVICE_ID, request.sync_id,
-            request.master_t1_us, local_t2_us, local_t3_us, busy_wait_us,
+            request.master_t1_us, local_t2_us, local_t3_us,
+            ip_input_us > 0 ? ip_input_us : 0, busy_wait_us,
             have_die_temperature, die_temperature_milli_c);
         const int64_t held_us_64 = esp_timer_get_time() - local_t3_us;
         if (held_us_64 <= 0) reported_hold_us = 0;
@@ -926,7 +986,8 @@ void SendSyncReply(int socket_fd, const sockaddr_in &peer,
         else reported_hold_us = static_cast<uint32_t>(held_us_64);
         length = factory_timer::FormatSyncReply(
             packet, sizeof(packet), CONFIG_FACTORY_DEVICE_ID, request.sync_id,
-            request.master_t1_us, local_t2_us, local_t3_us, reported_hold_us,
+            request.master_t1_us, local_t2_us, local_t3_us,
+            ip_input_us > 0 ? ip_input_us : 0, reported_hold_us,
             have_die_temperature, die_temperature_milli_c);
         format_done_us = esp_timer_get_time();
     }
@@ -958,7 +1019,8 @@ void SendSyncApplied(int socket_fd, const sockaddr_in &peer,
     char packet[factory_timer::kMaxPacketLength + 1]{};
     const int length = factory_timer::FormatSyncApplied(
         packet, sizeof(packet), CONFIG_FACTORY_DEVICE_ID, sync_set.sync_id,
-        sync_set.master_minus_local_offset_us, sync_set.best_rtt_us);
+        sync_set.master_minus_local_offset_us, sync_set.best_rtt_us,
+        sync_set.offset_epoch_local_us);
     SendPacket(socket_fd, peer, packet, length, "SYNC_APPLIED");
 }
 
@@ -1091,9 +1153,23 @@ void TimerTask(void *) {
                         scheduled_start_metadata.sync_applied_local_us;
                     event.sync_estimated_master_us =
                         scheduled_start_metadata.sync_estimated_master_us;
+                    event.source_offset_us = scheduled_start_metadata.source_offset_us;
+                    event.offset_epoch_local_us = scheduled_start_metadata.offset_epoch_local_us;
+                    event.offset_epoch_disciplined_us =
+                        scheduled_start_metadata.offset_epoch_disciplined_us;
+                    event.estimated_master_epoch_us =
+                        scheduled_start_metadata.estimated_master_epoch_us;
                     if (event.target_master_start_us > 0) {
-                        event.estimated_master_start_us =
-                            now + scheduled_start_metadata.master_minus_local_offset_us;
+                        if (event.offset_epoch_disciplined_us > 0 &&
+                            event.estimated_master_epoch_us > 0) {
+                            event.estimated_master_start_us =
+                                event.estimated_master_epoch_us +
+                                (event.actual_disciplined_start_us -
+                                 event.offset_epoch_disciplined_us);
+                        } else {
+                            event.estimated_master_start_us =
+                                now + scheduled_start_metadata.master_minus_local_offset_us;
+                        }
                     }
                 }
 
@@ -1146,6 +1222,23 @@ const char *RxBoundaryPacketTypeName(const RxBoundaryEvent &event) {
             return factory_timer::CommandTypeName(event.command_type);
     }
     return "UNKNOWN";
+}
+
+bool ShouldSuppressRunningHeartbeat(const factory_timer::TimerSnapshot &snapshot) {
+#if defined(CONFIG_FACTORY_SUPPRESS_RUNNING_HEARTBEAT) && CONFIG_FACTORY_SUPPRESS_RUNNING_HEARTBEAT
+    return snapshot.state == factory_timer::TimerState::Running;
+#else
+    (void)snapshot;
+    return false;
+#endif
+}
+
+void RecordSuppressedRunningHeartbeat() {
+    running_heartbeat_suppressed.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ResetNetworkSilentDiagnostics() {
+    running_heartbeat_suppressed.store(0, std::memory_order_relaxed);
 }
 
 void ResetNetworkTimingDiagnostics() {
@@ -1297,6 +1390,7 @@ void DumpNetworkTimingDiagnostics() {
                  source_ip,
                  static_cast<unsigned>(event.source_port),
                  RxBoundaryPacketTypeName(event));
+        DiagnosticDumpPace();
     }
     ESP_LOGI(kTag, "RX_BOUNDARY_TRACE_END");
 
@@ -1341,6 +1435,7 @@ void DumpNetworkTimingDiagnostics() {
                  static_cast<long long>(r.send.send_status_end_us),
                  static_cast<long long>(r.handler_exit_us),
                  factory_timer::TimerStateName(r.snapshot_state));
+        DiagnosticDumpPace();
     }
     ESP_LOGI(kTag, "STATUS_PATH_TRACE_END");
 
@@ -1365,6 +1460,7 @@ void DumpNetworkTimingDiagnostics() {
                  static_cast<long long>(r.send.sendto_entry_us),
                  static_cast<long long>(r.send.sendto_return_us),
                  static_cast<long long>(r.send.send_status_end_us));
+        DiagnosticDumpPace();
     }
     ESP_LOGI(kTag, "STATUS_TX_TRACE_END");
 }
@@ -1373,6 +1469,51 @@ void InitialiseRxBoundaryTrace() {}
 void ResetNetworkTimingDiagnostics() {}
 void MaybeQueueRxNearBoundary(int64_t, const sockaddr_in &, const factory_timer::MasterPacket *) {}
 void DumpNetworkTimingDiagnostics() {}
+#endif
+
+#if defined(CONFIG_FACTORY_POST_RUN_TIMING_DUMP) && CONFIG_FACTORY_POST_RUN_TIMING_DUMP
+void DiagnosticDumpTask(void *) {
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        const int64_t begin_us = esp_timer_get_time();
+        ESP_LOGI(kTag, "POST_RUN_DIAG_BEGIN local_us=%lld", static_cast<long long>(begin_us));
+#if defined(CONFIG_FACTORY_SUPPRESS_RUNNING_HEARTBEAT) && CONFIG_FACTORY_SUPPRESS_RUNNING_HEARTBEAT
+        ESP_LOGI(kTag,
+                 "NETWORK_SILENT_DIAG running_heartbeat_suppressed=%u",
+                 static_cast<unsigned>(running_heartbeat_suppressed.load(std::memory_order_relaxed)));
+#endif
+        DumpSyncReplyTrace();
+        rtc_discipline_dump_sqw_trace();
+        DumpNetworkTimingDiagnostics();
+        const int64_t end_us = esp_timer_get_time();
+        ESP_LOGI(kTag,
+                 "POST_RUN_DIAG_END local_us=%lld duration_us=%lld command_task_blocked=0",
+                 static_cast<long long>(end_us),
+                 static_cast<long long>(end_us - begin_us));
+    }
+}
+
+void InitialiseDiagnosticDumpTask() {
+    if (xTaskCreatePinnedToCore(&DiagnosticDumpTask,
+                                "timing_dump",
+                                4096,
+                                nullptr,
+                                kDiagnosticDumpTaskPriority,
+                                &diagnostic_dump_task_handle,
+                                kControlTaskCore) != pdPASS) {
+        ESP_LOGE(kTag, "Could not create asynchronous timing-dump task");
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    }
+}
+
+void RequestPostRunDiagnosticDump() {
+    if (diagnostic_dump_task_handle != nullptr) {
+        xTaskNotifyGive(diagnostic_dump_task_handle);
+    }
+}
+#else
+void InitialiseDiagnosticDumpTask() {}
+void RequestPostRunDiagnosticDump() {}
 #endif
 
 void InitialiseStartScheduler() {
@@ -1554,25 +1695,50 @@ void CommandTask(void *) {
                             sync_reply_trace[i].selected_by_sync_set = true;
                         }
                     }
-                    clock_sync.master_minus_local_offset_us =
+                    clock_sync.source_offset_us =
                         packet.sync_set.master_minus_local_offset_us;
                     clock_sync.best_rtt_us = packet.sync_set.best_rtt_us;
                     clock_sync.sync_id = packet.sync_set.sync_id;
                     clock_sync.applied_local_us = receive_local_us;
-                    clock_sync.estimated_master_apply_us =
-                        receive_local_us + clock_sync.master_minus_local_offset_us;
+                    if (packet.sync_set.offset_epoch_local_us > 0) {
+                        clock_sync.offset_epoch_local_us =
+                            packet.sync_set.offset_epoch_local_us;
+                        clock_sync.offset_epoch_disciplined_us =
+                            rtc_discipline_local_to_disciplined_us(
+                                clock_sync.offset_epoch_local_us);
+                        clock_sync.estimated_master_epoch_us =
+                            clock_sync.offset_epoch_local_us + clock_sync.source_offset_us;
+                        const int64_t apply_disciplined_us =
+                            rtc_discipline_local_to_disciplined_us(receive_local_us);
+                        clock_sync.estimated_master_apply_us =
+                            clock_sync.estimated_master_epoch_us +
+                            (apply_disciplined_us - clock_sync.offset_epoch_disciplined_us);
+                        clock_sync.master_minus_local_offset_us =
+                            clock_sync.estimated_master_apply_us - receive_local_us;
+                    } else {
+                        // Preserve legacy four-timestamp benchmark/manual behavior.
+                        clock_sync.offset_epoch_local_us = 0;
+                        clock_sync.offset_epoch_disciplined_us = 0;
+                        clock_sync.estimated_master_epoch_us = 0;
+                        clock_sync.master_minus_local_offset_us =
+                            clock_sync.source_offset_us;
+                        clock_sync.estimated_master_apply_us =
+                            receive_local_us + clock_sync.master_minus_local_offset_us;
+                    }
                     clock_sync.valid.store(true, std::memory_order_release);
                     SendSyncApplied(socket_fd, peer, packet.sync_set);
                     ESP_LOGI(kTag,
-                             "Clock synchronized: offset_master_minus_local_us=%lld best_rtt_us=%llu sync=%016llX",
+                             "Clock synchronized: offset_master_minus_local_us=%lld best_rtt_us=%llu sync=%016llX source_offset_us=%lld offset_epoch_local_us=%lld",
                              static_cast<long long>(clock_sync.master_minus_local_offset_us),
                              static_cast<unsigned long long>(clock_sync.best_rtt_us),
-                             static_cast<unsigned long long>(clock_sync.sync_id));
+                             static_cast<unsigned long long>(clock_sync.sync_id),
+                             static_cast<long long>(clock_sync.source_offset_us),
+                             static_cast<long long>(clock_sync.offset_epoch_local_us));
 #if defined(CONFIG_FACTORY_RTC_QUAL_LOGS) && CONFIG_FACTORY_RTC_QUAL_LOGS
                     rtc_discipline_status_t rtc_status{};
                     rtc_discipline_get_status(&rtc_status);
                     ESP_LOGI(kTag,
-                             "RTC_SYNC_QUAL device=%s sync=%016llX local_us=%lld estimated_master_us=%lld offset_master_minus_local_us=%lld best_rtt_us=%llu state=%s rate_ppm=%+.6f rms_us=%.3f points=%u temp_valid=%u temp_c=%.2f",
+                             "RTC_SYNC_QUAL device=%s sync=%016llX local_us=%lld estimated_master_us=%lld offset_master_minus_local_us=%lld best_rtt_us=%llu state=%s rate_ppm=%+.6f rms_us=%.3f points=%u temp_valid=%u temp_c=%.2f source_offset_us=%lld offset_epoch_local_us=%lld",
                              CONFIG_FACTORY_DEVICE_ID,
                              static_cast<unsigned long long>(clock_sync.sync_id),
                              static_cast<long long>(clock_sync.applied_local_us),
@@ -1586,7 +1752,9 @@ void CommandTask(void *) {
                              rtc_status.rtc_temperature_valid ? 1u : 0u,
                              rtc_status.rtc_temperature_valid
                                  ? static_cast<double>(rtc_status.rtc_temperature_c)
-                                 : 0.0);
+                                 : 0.0,
+                             static_cast<long long>(clock_sync.source_offset_us),
+                             static_cast<long long>(clock_sync.offset_epoch_local_us));
 #endif
                 } else {
                     const auto &command = packet.command;
@@ -1609,11 +1777,19 @@ void CommandTask(void *) {
                         last_heartbeat = receive_local_us;
                     } else if ((command.type == factory_timer::CommandType::StartAt ||
                                 command.type == factory_timer::CommandType::Start) &&
-                               !RtcRunGateLocked()) {
+                               !RtcRunGateQualified()) {
+                        const RtcStatusFields rtc = CurrentRtcStatusFields();
                         ESP_LOGW(kTag,
-                                 "%s rejected because RTC discipline is not LOCKED (state=%s): command=%016llX",
+                                 "%s rejected because RTC is not START-qualified "
+                                 "(state=%s points=%u/%u rms_us=%.3f/%.3f queue_drops=%u temp_valid=%u): command=%016llX",
                                  factory_timer::CommandTypeName(command.type),
-                                 CurrentRtcDisciplineStateName(),
+                                 rtc.state,
+                                 static_cast<unsigned>(rtc.fit_points),
+                                 static_cast<unsigned>(kRtcStartMinimumFitPoints),
+                                 rtc.fit_rms_us,
+                                 kRtcStartMaximumFitRmsUs,
+                                 static_cast<unsigned>(rtc.queue_drops),
+                                 rtc.temperature_valid ? 1u : 0u,
                                  static_cast<unsigned long long>(command.command_id));
                         SendAck(socket_fd, peer, command, factory_timer::AckResult::NotSynced);
                         xSemaphoreTake(countdown_mutex, portMAX_DELAY);
@@ -1633,8 +1809,19 @@ void CommandTask(void *) {
                     } else {
                         int64_t local_start_us = 0;
                         if (command.type == factory_timer::CommandType::StartAt) {
-                            local_start_us = command.start_at_master_us -
-                                clock_sync.master_minus_local_offset_us;
+                            if (clock_sync.offset_epoch_disciplined_us > 0 &&
+                                clock_sync.estimated_master_epoch_us > 0) {
+                                const int64_t target_disciplined_us =
+                                    clock_sync.offset_epoch_disciplined_us +
+                                    (command.start_at_master_us -
+                                     clock_sync.estimated_master_epoch_us);
+                                local_start_us =
+                                    rtc_discipline_disciplined_to_local_us(
+                                        target_disciplined_us);
+                            } else {
+                                local_start_us = command.start_at_master_us -
+                                    clock_sync.master_minus_local_offset_us;
+                            }
                         }
 #if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
                         if (trace_status_path) status_trace.lock_request_us = esp_timer_get_time();
@@ -1698,7 +1885,24 @@ void CommandTask(void *) {
                                     command.type == factory_timer::CommandType::StartAt
                                         ? clock_sync.estimated_master_apply_us
                                         : 0;
+                                scheduled_start_metadata.source_offset_us =
+                                    command.type == factory_timer::CommandType::StartAt
+                                        ? clock_sync.source_offset_us
+                                        : 0;
+                                scheduled_start_metadata.offset_epoch_local_us =
+                                    command.type == factory_timer::CommandType::StartAt
+                                        ? clock_sync.offset_epoch_local_us
+                                        : 0;
+                                scheduled_start_metadata.offset_epoch_disciplined_us =
+                                    command.type == factory_timer::CommandType::StartAt
+                                        ? clock_sync.offset_epoch_disciplined_us
+                                        : 0;
+                                scheduled_start_metadata.estimated_master_epoch_us =
+                                    command.type == factory_timer::CommandType::StartAt
+                                        ? clock_sync.estimated_master_epoch_us
+                                        : 0;
                                 ResetNetworkTimingDiagnostics();
+                                ResetNetworkSilentDiagnostics();
                                 ArmStartTimerLocked(countdown.ScheduledStartMicroseconds());
 #if defined(CONFIG_FACTORY_DISPLAY_TEST) && CONFIG_FACTORY_DISPLAY_TEST
                                 factory_display_arm(countdown.ScheduledStartMicroseconds(),
@@ -1781,7 +1985,7 @@ void CommandTask(void *) {
                     timer_event.actual_local_start_us -
                     timer_event.sync_applied_local_us;
                 ESP_LOGI(kTag,
-                         "RTC_START_QUAL device=%s command=%016llX sync=%016llX sync_local_us=%lld sync_estimated_master_us=%lld offset_master_minus_local_us=%lld best_rtt_us=%llu target_master_us=%lld actual_local_us=%lld estimated_master_us=%lld start_error_us=%lld scheduler_lateness_us=%lld sync_age_local_us=%lld disciplined_start_us=%lld",
+                         "RTC_START_QUAL device=%s command=%016llX sync=%016llX sync_local_us=%lld sync_estimated_master_us=%lld offset_master_minus_local_us=%lld best_rtt_us=%llu target_master_us=%lld actual_local_us=%lld estimated_master_us=%lld start_error_us=%lld scheduler_lateness_us=%lld sync_age_local_us=%lld disciplined_start_us=%lld source_offset_us=%lld offset_epoch_local_us=%lld",
                          CONFIG_FACTORY_DEVICE_ID,
                          static_cast<unsigned long long>(timer_event.snapshot.last_command_id),
                          static_cast<unsigned long long>(timer_event.sync_id),
@@ -1795,7 +1999,9 @@ void CommandTask(void *) {
                          static_cast<long long>(start_error_us),
                          static_cast<long long>(scheduler_lateness_us),
                          static_cast<long long>(sync_age_local_us),
-                         static_cast<long long>(timer_event.actual_disciplined_start_us));
+                         static_cast<long long>(timer_event.actual_disciplined_start_us),
+                         static_cast<long long>(timer_event.source_offset_us),
+                         static_cast<long long>(timer_event.offset_epoch_local_us));
             }
 #endif
 
@@ -1848,25 +2054,57 @@ void CommandTask(void *) {
             } else if (snapshot.state == factory_timer::TimerState::Finished) {
                 ESP_LOGI(kTag, "Countdown finished: command=%016llX",
                          static_cast<unsigned long long>(snapshot.last_command_id));
-                DumpSyncReplyTrace();
-                rtc_discipline_dump_sqw_trace();
-                DumpNetworkTimingDiagnostics();
+                RequestPostRunDiagnosticDump();
             }
+            bool status_sent = false;
             if (have_peer) {
+                bool send_state_change = true;
+#if !defined(CONFIG_FACTORY_PER_SECOND_STATE_CHANGE_STATUS) || !CONFIG_FACTORY_PER_SECOND_STATE_CHANGE_STATUS
+                if (snapshot.state == factory_timer::TimerState::Running &&
+                    last_snapshot.state == factory_timer::TimerState::Running &&
+                    snapshot.remaining_seconds != last_snapshot.remaining_seconds) {
+                    send_state_change = false;
+                }
+#endif
+                if (send_state_change) {
 #if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
-                SendStatusWithTrace(socket_fd, last_peer, snapshot, StatusSendReason::StateChange);
+                    SendStatusWithTrace(socket_fd, last_peer, snapshot, StatusSendReason::StateChange);
+#else
+                    SendStatus(socket_fd, last_peer, snapshot);
+#endif
+                    status_sent = true;
+                } else if (now - last_heartbeat >= kHeartbeatIntervalUs) {
+                    if (ShouldSuppressRunningHeartbeat(snapshot)) {
+                        // v6.20 production behavior: keep RUNNING heartbeat traffic silent
+                        // before Wi-Fi/RTC/status formatting/sendto work begins.
+                        RecordSuppressedRunningHeartbeat();
+                        last_heartbeat = now;
+                    } else {
+#if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
+                        SendStatusWithTrace(socket_fd, last_peer, snapshot, StatusSendReason::Heartbeat);
+#else
+                        SendStatus(socket_fd, last_peer, snapshot);
+#endif
+                        status_sent = true;
+                    }
+                }
+            }
+            last_snapshot = snapshot;
+            if (status_sent || !have_peer) {
+                last_heartbeat = now;
+            }
+        } else if (have_peer && now - last_heartbeat >= kHeartbeatIntervalUs) {
+            if (ShouldSuppressRunningHeartbeat(snapshot)) {
+                RecordSuppressedRunningHeartbeat();
+            } else {
+#if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
+                SendStatusWithTrace(socket_fd, last_peer, snapshot, StatusSendReason::Heartbeat);
 #else
                 SendStatus(socket_fd, last_peer, snapshot);
 #endif
             }
-            last_snapshot = snapshot;
-            last_heartbeat = now;
-        } else if (have_peer && now - last_heartbeat >= kHeartbeatIntervalUs) {
-#if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
-            SendStatusWithTrace(socket_fd, last_peer, snapshot, StatusSendReason::Heartbeat);
-#else
-            SendStatus(socket_fd, last_peer, snapshot);
-#endif
+            // Advance cadence even when suppressed so an overdue heartbeat cannot
+            // repeatedly re-enter this branch on every CommandTask iteration.
             last_heartbeat = now;
         }
     }
@@ -1940,6 +2178,7 @@ extern "C" void app_main() {
 #endif
     InitialiseStartScheduler();
     InitialiseRxBoundaryTrace();
+    InitialiseDiagnosticDumpTask();
     InitialiseWifi();
     if (xTaskCreatePinnedToCore(&CommandTask, "udp_command", 7168, nullptr,
                                 kCommandTaskPriority, nullptr,

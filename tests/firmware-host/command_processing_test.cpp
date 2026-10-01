@@ -170,34 +170,50 @@ void CheckProtocolFormats() {
     CHECK(master.type == factory_timer::MasterPacketType::SyncSet);
     CHECK(master.sync_set.master_minus_local_offset_us == -987654);
     CHECK(master.sync_set.best_rtt_us == 4200);
+    CHECK(master.sync_set.offset_epoch_local_us == 0);
+
+    CHECK(factory_timer::ParseMasterPacket(
+        "FCT2|SYNC_SET|0123456789ABCDEF|-987654|4200|7654321", master, error));
+    CHECK(master.type == factory_timer::MasterPacketType::SyncSet);
+    CHECK(master.sync_set.master_minus_local_offset_us == -987654);
+    CHECK(master.sync_set.best_rtt_us == 4200);
+    CHECK(master.sync_set.offset_epoch_local_us == 7654321);
 
     char packet[factory_timer::kMaxPacketLength + 1]{};
     int length = factory_timer::FormatStatus(
         packet, sizeof(packet), "ESP03", 0x0123456789abcdefULL,
-        factory_timer::TimerState::Running, 19, -57, 6, "AA:BB:CC:DD:EE:FF", "LOCKED");
+        factory_timer::TimerState::Running, 19, -57, 6, "AA:BB:CC:DD:EE:FF", "LOCKED",
+        129, 0.785, 0, true);
     CHECK(length > 0);
     CHECK(std::string_view(packet, static_cast<std::size_t>(length)) ==
-          "FCT2|STATUS|ESP03|0123456789ABCDEF|RUNNING|19|-57|6|AA:BB:CC:DD:EE:FF|LOCKED");
+          "FCT2|STATUS|ESP03|0123456789ABCDEF|RUNNING|19|-57|6|AA:BB:CC:DD:EE:FF|LOCKED|129|0.785|0|1");
 
     length = factory_timer::FormatSyncReply(
         packet, sizeof(packet), "ESP02", 0x0123456789abcdefULL,
-        100000, 40000, 40005);
+        100000, 40000, 40005, 39950);
     CHECK(length > 0);
     CHECK(std::string_view(packet, static_cast<std::size_t>(length)) ==
-          "FCT2|SYNC_REPLY|ESP02|0123456789ABCDEF|100000|40000|40005");
+          "FCT2|SYNC_REPLY|ESP02|0123456789ABCDEF|100000|40000|40005|0|39950");
 
     length = factory_timer::FormatSyncReply(
         packet, sizeof(packet), "ESP03", 0x0123456789abcdefULL,
-        100000, 40000, 40005, 0, true, 41250);
+        100000, 40000, 40005, 39950, 0, true, 41250);
     CHECK(length > 0);
     CHECK(std::string_view(packet, static_cast<std::size_t>(length)) ==
-          "FCT2|SYNC_REPLY|ESP03|0123456789ABCDEF|100000|40000|40005|0|41250");
+          "FCT2|SYNC_REPLY|ESP03|0123456789ABCDEF|100000|40000|40005|0|39950|41250");
 
     const auto start_at = Parse("FCT2|CMD|START_AT|0000000000000010|3|5000000");
     length = factory_timer::FormatAck(
         packet, sizeof(packet), "ESP01", start_at, factory_timer::AckResult::NotSynced);
     CHECK(std::string_view(packet, static_cast<std::size_t>(length)) ==
           "FCT1|ACK|ESP01|0000000000000010|START_AT|NOT_SYNCED");
+
+    length = factory_timer::FormatSyncApplied(
+        packet, sizeof(packet), "ESP01", 0x0123456789abcdefULL,
+        -987654, 4200, 7654321);
+    CHECK(length > 0);
+    CHECK(std::string_view(packet, static_cast<std::size_t>(length)) ==
+          "FCT2|SYNC_APPLIED|ESP01|0123456789ABCDEF|-987654|4200|7654321");
 
     length = factory_timer::FormatStarted(
         packet, sizeof(packet), "ESP01", 0x10, 2000000, 5000002, 5000000);

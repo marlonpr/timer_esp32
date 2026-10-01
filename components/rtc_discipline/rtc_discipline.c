@@ -27,10 +27,12 @@
 #define TEMP_REFRESH_ACCEPTED_EDGES 64
 #define SQW_INTERVAL_WINDOW 64
 #define SQW_TRACE_CAPACITY 128
+#define FIT_RESIDUAL_MIN_LOCKED_POINTS 3
 
 typedef struct {
     int64_t sequence;
     int64_t local_us;
+    bool eligible;
 } fit_point_t;
 
 typedef struct {
@@ -245,34 +247,128 @@ static void reset_fit(void)
     taskEXIT_CRITICAL(&s_ctx.mux);
 }
 
+static uint16_t eligible_fit_point_count(void);
+
 static void add_fit_point(int64_t sequence, int64_t local_us)
 {
     const uint16_t capacity = s_ctx.cfg.fit_points;
 
     if (s_ctx.point_count < capacity) {
         const uint16_t index = (uint16_t)((s_ctx.point_head + s_ctx.point_count) % capacity);
-        s_ctx.points[index] = (fit_point_t){.sequence = sequence, .local_us = local_us};
+        s_ctx.points[index] = (fit_point_t){.sequence = sequence, .local_us = local_us, .eligible = true};
         s_ctx.point_count++;
     } else {
-        s_ctx.points[s_ctx.point_head] = (fit_point_t){.sequence = sequence, .local_us = local_us};
+        s_ctx.points[s_ctx.point_head] = (fit_point_t){.sequence = sequence, .local_us = local_us, .eligible = true};
         s_ctx.point_head = (uint16_t)((s_ctx.point_head + 1u) % capacity);
     }
 
     taskENTER_CRITICAL(&s_ctx.mux);
-    s_ctx.status.fit_point_count = s_ctx.point_count;
+    s_ctx.status.fit_point_count = eligible_fit_point_count();
     taskEXIT_CRITICAL(&s_ctx.mux);
+}
+
+static uint16_t eligible_fit_point_count(void)
+{
+    uint16_t count = 0;
+    for (uint16_t i = 0; i < s_ctx.point_count; ++i) {
+        const uint16_t index = (uint16_t)((s_ctx.point_head + i) % s_ctx.cfg.fit_points);
+        if (s_ctx.points[index].eligible) count++;
+    }
+    return count;
+}
+
+static bool mark_fit_point_ineligible(int64_t sequence, double residual_us)
+{
+    for (uint16_t i = 0; i < s_ctx.point_count; ++i) {
+        const uint16_t index = (uint16_t)((s_ctx.point_head + i) % s_ctx.cfg.fit_points);
+        fit_point_t *point = &s_ctx.points[index];
+        if (point->sequence != sequence || !point->eligible) continue;
+
+        point->eligible = false;
+        const double magnitude = fabs(residual_us);
+        taskENTER_CRITICAL(&s_ctx.mux);
+        s_ctx.status.fit_outlier_edges++;
+        s_ctx.status.fit_last_outlier_residual_us = residual_us;
+        if (magnitude > s_ctx.status.fit_max_abs_outlier_residual_us) {
+            s_ctx.status.fit_max_abs_outlier_residual_us = magnitude;
+        }
+        s_ctx.status.fit_point_count = eligible_fit_point_count();
+        taskEXIT_CRITICAL(&s_ctx.mux);
+        return true;
+    }
+    return false;
+}
+
+static void maybe_exclude_previous_timestamp_outlier(int64_t current_sequence,
+                                                      int64_t current_local_us,
+                                                      double expected_us_per_second)
+{
+#if defined(CONFIG_FACTORY_RTC_FIT_RESIDUAL_REJECTION) && CONFIG_FACTORY_RTC_FIT_RESIDUAL_REJECTION
+    if (s_ctx.point_count < FIT_RESIDUAL_MIN_LOCKED_POINTS - 1u ||
+        !isfinite(expected_us_per_second) ||
+        expected_us_per_second < 900000.0 || expected_us_per_second > 1100000.0) {
+        return;
+    }
+
+    rtc_discipline_state_t state;
+    taskENTER_CRITICAL(&s_ctx.mux);
+    state = s_ctx.status.state;
+    taskEXIT_CRITICAL(&s_ctx.mux);
+    if (state != RTC_DISCIPLINE_LOCKED) return;
+
+    const uint16_t b_index = (uint16_t)((s_ctx.point_head + s_ctx.point_count - 1u) % s_ctx.cfg.fit_points);
+    const uint16_t a_index = (uint16_t)((s_ctx.point_head + s_ctx.point_count - 2u) % s_ctx.cfg.fit_points);
+    const fit_point_t *a = &s_ctx.points[a_index];
+    const fit_point_t *b = &s_ctx.points[b_index];
+
+    /* Only classify an isolated center edge when both neighboring physical SQW
+     * intervals are one second. Missing-edge inference is handled separately. */
+    if (b->sequence != a->sequence + 1 || current_sequence != b->sequence + 1) return;
+
+    const double first_interval_residual_us =
+        (double)(b->local_us - a->local_us) - expected_us_per_second;
+    const double second_interval_residual_us =
+        (double)(current_local_us - b->local_us) - expected_us_per_second;
+    const double threshold_us = (double)CONFIG_FACTORY_RTC_FIT_RESIDUAL_THRESHOLD_US;
+
+    /* A displacement d of the shared center timestamp produces +d on one
+     * interval and -d on the next. A delayed current endpoint or a delayed
+     * previous endpoint affects only one side, so it is not misclassified. */
+    if (fabs(first_interval_residual_us) < threshold_us ||
+        fabs(second_interval_residual_us) < threshold_us ||
+        first_interval_residual_us * second_interval_residual_us >= 0.0) {
+        return;
+    }
+
+    const double center_residual_us =
+        0.5 * (first_interval_residual_us - second_interval_residual_us);
+    (void)mark_fit_point_ineligible(b->sequence, center_residual_us);
+#else
+    (void)current_sequence;
+    (void)current_local_us;
+    (void)expected_us_per_second;
+#endif
 }
 
 static bool fit_rate(double *slope_us_per_second, double *rms_us)
 {
-    if (!slope_us_per_second || !rms_us || s_ctx.point_count < s_ctx.cfg.acquire_points) {
-        return false;
-    }
+    if (!slope_us_per_second || !rms_us) return false;
 
-    const fit_point_t *first = &s_ctx.points[s_ctx.point_head];
+    const uint16_t eligible_count = eligible_fit_point_count();
+    if (eligible_count < s_ctx.cfg.acquire_points) return false;
+
+    const fit_point_t *first = NULL;
+    for (uint16_t i = 0; i < s_ctx.point_count; ++i) {
+        const uint16_t index = (uint16_t)((s_ctx.point_head + i) % s_ctx.cfg.fit_points);
+        if (s_ctx.points[index].eligible) {
+            first = &s_ctx.points[index];
+            break;
+        }
+    }
+    if (!first) return false;
+
     const double x0 = (double)first->sequence;
     const double y0 = (double)first->local_us;
-
     double sum_x = 0.0;
     double sum_y = 0.0;
     double sum_xx = 0.0;
@@ -280,39 +376,41 @@ static bool fit_rate(double *slope_us_per_second, double *rms_us)
 
     for (uint16_t i = 0; i < s_ctx.point_count; ++i) {
         const uint16_t index = (uint16_t)((s_ctx.point_head + i) % s_ctx.cfg.fit_points);
-        const double x = (double)s_ctx.points[index].sequence - x0;
-        const double y = (double)s_ctx.points[index].local_us - y0;
+        const fit_point_t *point = &s_ctx.points[index];
+        if (!point->eligible) continue;
+        const double x = (double)point->sequence - x0;
+        const double y = (double)point->local_us - y0;
         sum_x += x;
         sum_y += y;
         sum_xx += x * x;
         sum_xy += x * y;
     }
 
-    const double n = (double)s_ctx.point_count;
+    const double n = (double)eligible_count;
     const double denominator = n * sum_xx - sum_x * sum_x;
-    if (fabs(denominator) < 1e-9) {
-        return false;
-    }
+    if (fabs(denominator) < 1e-9) return false;
 
     const double slope = (n * sum_xy - sum_x * sum_y) / denominator;
     const double intercept = (sum_y - slope * sum_x) / n;
     const double ppm = slope - 1000000.0;
-
-    if (!isfinite(slope) || fabs(ppm) > SANE_RATE_LIMIT_PPM) {
-        return false;
-    }
+    if (!isfinite(slope) || fabs(ppm) > SANE_RATE_LIMIT_PPM) return false;
 
     double residual_sq = 0.0;
     for (uint16_t i = 0; i < s_ctx.point_count; ++i) {
         const uint16_t index = (uint16_t)((s_ctx.point_head + i) % s_ctx.cfg.fit_points);
-        const double x = (double)s_ctx.points[index].sequence - x0;
-        const double y = (double)s_ctx.points[index].local_us - y0;
+        const fit_point_t *point = &s_ctx.points[index];
+        if (!point->eligible) continue;
+        const double x = (double)point->sequence - x0;
+        const double y = (double)point->local_us - y0;
         const double residual = y - (intercept + slope * x);
         residual_sq += residual * residual;
     }
 
     *slope_us_per_second = slope;
     *rms_us = sqrt(residual_sq / n);
+    taskENTER_CRITICAL(&s_ctx.mux);
+    s_ctx.status.fit_point_count = eligible_count;
+    taskEXIT_CRITICAL(&s_ctx.mux);
     return true;
 }
 
@@ -392,7 +490,9 @@ static bool accept_edge(int64_t local_us)
         taskEXIT_CRITICAL(&s_ctx.mux);
     }
 
-    s_ctx.next_sequence += (span - 1);
+    const int64_t current_sequence = s_ctx.next_sequence + (span - 1);
+    maybe_exclude_previous_timestamp_outlier(current_sequence, local_us, expected_us);
+    s_ctx.next_sequence = current_sequence;
     add_fit_point(s_ctx.next_sequence, local_us);
     s_ctx.next_sequence++;
     s_ctx.last_accepted_local_us = local_us;

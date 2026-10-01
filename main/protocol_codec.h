@@ -60,6 +60,7 @@ struct SyncSetPacket {
     uint64_t sync_id{};
     int64_t master_minus_local_offset_us{};
     uint64_t best_rtt_us{};
+    int64_t offset_epoch_local_us{};
 };
 
 struct MasterPacket {
@@ -80,16 +81,19 @@ int FormatAck(char* destination, std::size_t capacity, std::string_view device_i
 int FormatStatus(char* destination, std::size_t capacity, std::string_view device_id,
                  uint64_t command_id, TimerState state, uint32_t remaining_seconds,
                  int rssi_dbm, uint8_t wifi_channel, std::string_view bssid,
-                 std::string_view rtc_discipline_state);
+                 std::string_view rtc_discipline_state, uint16_t rtc_fit_points,
+                 double rtc_fit_rms_us, uint32_t rtc_queue_drops,
+                 bool rtc_temperature_valid);
 int FormatSyncReply(char* destination, std::size_t capacity, std::string_view device_id,
                     uint64_t sync_id, int64_t master_t1_us,
                     int64_t local_t2_us, int64_t local_t3_us,
+                    int64_t ingress_local_us,
                     uint32_t actual_artificial_reply_delay_us = 0,
                     bool has_die_temperature = false,
                     int32_t die_temperature_milli_c = 0);
 int FormatSyncApplied(char* destination, std::size_t capacity, std::string_view device_id,
                       uint64_t sync_id, int64_t master_minus_local_offset_us,
-                      uint64_t best_rtt_us);
+                      uint64_t best_rtt_us, int64_t offset_epoch_local_us);
 int FormatStarted(char* destination, std::size_t capacity, std::string_view device_id,
                   uint64_t command_id, int64_t local_start_us,
                   int64_t estimated_master_start_us, int64_t target_master_start_us);

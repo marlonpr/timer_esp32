@@ -1,0 +1,14 @@
+v6.22 forward-only START synchronization + disciplined propagation
+
+Production START synchronization changes from v6.21:
+- SYNC_REPLY appends the earliest matched device ingress timestamp (ip_input_us).
+- SYNC_SET may carry the local epoch at which the forward-only offset is defined.
+- Firmware converts that source offset to an equivalent apply-time diagnostic offset.
+- START_AT propagates the offset epoch to T* through the DS3231-disciplined timebase,
+  then converts the disciplined deadline back to raw esp_timer for the deadline task.
+
+Unchanged:
+- v6.21 RTC START qualification gate.
+- production-silent RUNNING policy.
+- countdown boundary publication / HUB75 timing path.
+- SQW ISR core and symmetric residual filter (SQW changes are intentionally deferred).

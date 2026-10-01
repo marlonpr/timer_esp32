@@ -1,5 +1,7 @@
 #include "protocol_codec.h"
 
+#include <cmath>
+
 #include <array>
 #include <charconv>
 #include <cstdio>
@@ -233,29 +235,54 @@ bool ParseMasterPacket(std::string_view packet, MasterPacket& output, ParseError
     }
 
     if (packet.rfind("FCT2|SYNC_SET|", 0) == 0) {
-        std::array<std::string_view, 5> fields{};
-        if (!SplitExact(packet, fields)) {
-            error = ParseError::FieldCount;
-            return false;
+        std::string_view id_field;
+        std::string_view offset_field;
+        std::string_view rtt_field;
+        std::string_view epoch_field;
+        bool has_epoch = false;
+
+        std::array<std::string_view, 6> fields6{};
+        if (SplitExact(packet, fields6)) {
+            id_field = fields6[2];
+            offset_field = fields6[3];
+            rtt_field = fields6[4];
+            epoch_field = fields6[5];
+            has_epoch = true;
+        } else {
+            std::array<std::string_view, 5> fields5{};
+            if (!SplitExact(packet, fields5)) {
+                error = ParseError::FieldCount;
+                return false;
+            }
+            id_field = fields5[2];
+            offset_field = fields5[3];
+            rtt_field = fields5[4];
         }
+
         uint64_t sync_id = 0;
         int64_t offset = 0;
         uint64_t rtt = 0;
-        if (!ParseCommandId(fields[2], sync_id)) {
+        int64_t offset_epoch_local_us = 0;
+        if (!ParseCommandId(id_field, sync_id)) {
             error = ParseError::SyncId;
             return false;
         }
-        if (!ParseDecimal(fields[3], offset)) {
+        if (!ParseDecimal(offset_field, offset)) {
             error = ParseError::Offset;
             return false;
         }
-        if (!ParseDecimal(fields[4], rtt)) {
+        if (!ParseDecimal(rtt_field, rtt)) {
             error = ParseError::Rtt;
+            return false;
+        }
+        if (has_epoch &&
+            (!ParseDecimal(epoch_field, offset_epoch_local_us) || offset_epoch_local_us <= 0)) {
+            error = ParseError::Timestamp;
             return false;
         }
         output = {};
         output.type = MasterPacketType::SyncSet;
-        output.sync_set = SyncSetPacket{sync_id, offset, rtt};
+        output.sync_set = SyncSetPacket{sync_id, offset, rtt, offset_epoch_local_us};
         return true;
     }
 
@@ -334,68 +361,75 @@ int FormatAck(char* destination, std::size_t capacity, std::string_view device_i
 int FormatStatus(char* destination, std::size_t capacity, std::string_view device_id,
                  uint64_t command_id, TimerState state, uint32_t remaining_seconds,
                  int rssi_dbm, uint8_t wifi_channel, std::string_view bssid,
-                 std::string_view rtc_discipline_state) {
+                 std::string_view rtc_discipline_state, uint16_t rtc_fit_points,
+                 double rtc_fit_rms_us, uint32_t rtc_queue_drops,
+                 bool rtc_temperature_valid) {
     if (destination == nullptr || capacity == 0 || !ValidDeviceId(device_id) ||
         bssid.size() != 17 || rtc_discipline_state.empty() ||
-        rtc_discipline_state.size() > 16) return -1;
+        rtc_discipline_state.size() > 16 || !std::isfinite(rtc_fit_rms_us) ||
+        rtc_fit_rms_us < 0.0 || rtc_fit_rms_us > 1000000.0) return -1;
     return std::snprintf(destination, capacity,
-                         "FCT2|STATUS|%.*s|%016llX|%s|%u|%d|%u|%.*s|%.*s",
+                         "FCT2|STATUS|%.*s|%016llX|%s|%u|%d|%u|%.*s|%.*s|%u|%.3f|%u|%u",
                          static_cast<int>(device_id.size()), device_id.data(),
                          static_cast<unsigned long long>(command_id), TimerStateName(state),
                          static_cast<unsigned>(remaining_seconds), rssi_dbm,
                          static_cast<unsigned>(wifi_channel),
                          static_cast<int>(bssid.size()), bssid.data(),
-                         static_cast<int>(rtc_discipline_state.size()), rtc_discipline_state.data());
+                         static_cast<int>(rtc_discipline_state.size()), rtc_discipline_state.data(),
+                         static_cast<unsigned>(rtc_fit_points), rtc_fit_rms_us,
+                         static_cast<unsigned>(rtc_queue_drops), rtc_temperature_valid ? 1u : 0u);
 }
 
 int FormatSyncReply(char* destination, std::size_t capacity, std::string_view device_id,
                     uint64_t sync_id, int64_t master_t1_us,
                     int64_t local_t2_us, int64_t local_t3_us,
+                    int64_t ingress_local_us,
                     uint32_t actual_artificial_reply_delay_us,
                     bool has_die_temperature,
                     int32_t die_temperature_milli_c) {
-    if (destination == nullptr || capacity == 0 || !ValidDeviceId(device_id) || sync_id == 0) return -1;
+    if (destination == nullptr || capacity == 0 || !ValidDeviceId(device_id) ||
+        sync_id == 0 || ingress_local_us < 0) return -1;
 
-    // Preserve the original seven/eight-field forms when die temperature is
-    // unavailable. BG-1 adds a ninth field only on targets where the supported
-    // ESP-IDF temperature-sensor driver is active. Field 8 remains the v9.2
-    // reverse-hold measurement, including zero for ordinary shadow samples.
+    // v6.22 extends SYNC_REPLY with the earliest matched device ingress timestamp.
+    // Classic ESP32 form: ...|T3|actual_reverse_hold_us|ingress_local_us
+    // S3 diagnostic form appends die temperature after ingress.
     if (has_die_temperature) {
         return std::snprintf(destination, capacity,
-                             "FCT2|SYNC_REPLY|%.*s|%016llX|%lld|%lld|%lld|%u|%ld",
+                             "FCT2|SYNC_REPLY|%.*s|%016llX|%lld|%lld|%lld|%u|%lld|%ld",
                              static_cast<int>(device_id.size()), device_id.data(),
                              static_cast<unsigned long long>(sync_id),
                              static_cast<long long>(master_t1_us),
                              static_cast<long long>(local_t2_us),
                              static_cast<long long>(local_t3_us),
                              static_cast<unsigned>(actual_artificial_reply_delay_us),
+                             static_cast<long long>(ingress_local_us),
                              static_cast<long>(die_temperature_milli_c));
     }
 
-    if (actual_artificial_reply_delay_us == 0) {
-        return std::snprintf(destination, capacity,
-                             "FCT2|SYNC_REPLY|%.*s|%016llX|%lld|%lld|%lld",
-                             static_cast<int>(device_id.size()), device_id.data(),
-                             static_cast<unsigned long long>(sync_id),
-                             static_cast<long long>(master_t1_us),
-                             static_cast<long long>(local_t2_us),
-                             static_cast<long long>(local_t3_us));
-    }
-
     return std::snprintf(destination, capacity,
-                         "FCT2|SYNC_REPLY|%.*s|%016llX|%lld|%lld|%lld|%u",
+                         "FCT2|SYNC_REPLY|%.*s|%016llX|%lld|%lld|%lld|%u|%lld",
                          static_cast<int>(device_id.size()), device_id.data(),
                          static_cast<unsigned long long>(sync_id),
                          static_cast<long long>(master_t1_us),
                          static_cast<long long>(local_t2_us),
                          static_cast<long long>(local_t3_us),
-                         static_cast<unsigned>(actual_artificial_reply_delay_us));
+                         static_cast<unsigned>(actual_artificial_reply_delay_us),
+                         static_cast<long long>(ingress_local_us));
 }
 
 int FormatSyncApplied(char* destination, std::size_t capacity, std::string_view device_id,
                       uint64_t sync_id, int64_t master_minus_local_offset_us,
-                      uint64_t best_rtt_us) {
+                      uint64_t best_rtt_us, int64_t offset_epoch_local_us) {
     if (destination == nullptr || capacity == 0 || !ValidDeviceId(device_id) || sync_id == 0) return -1;
+    if (offset_epoch_local_us > 0) {
+        return std::snprintf(destination, capacity,
+                             "FCT2|SYNC_APPLIED|%.*s|%016llX|%lld|%llu|%lld",
+                             static_cast<int>(device_id.size()), device_id.data(),
+                             static_cast<unsigned long long>(sync_id),
+                             static_cast<long long>(master_minus_local_offset_us),
+                             static_cast<unsigned long long>(best_rtt_us),
+                             static_cast<long long>(offset_epoch_local_us));
+    }
     return std::snprintf(destination, capacity,
                          "FCT2|SYNC_APPLIED|%.*s|%016llX|%lld|%llu",
                          static_cast<int>(device_id.size()), device_id.data(),

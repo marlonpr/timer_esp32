@@ -363,13 +363,28 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
                  int rssi_dbm, uint8_t wifi_channel, std::string_view bssid,
                  std::string_view rtc_discipline_state, uint16_t rtc_fit_points,
                  double rtc_fit_rms_us, uint32_t rtc_queue_drops,
-                 bool rtc_temperature_valid) {
+                 bool rtc_temperature_valid, double rtc_rate_ppm_vs_rtc,
+                 uint64_t rtc_fit_outliers, double rtc_temperature_c,
+                 int rtc_sqw_core, uint8_t health_flags,
+                 int64_t sync_source_offset_us, int64_t sync_epoch_local_us,
+                 int64_t sync_epoch_disciplined_us,
+                 int64_t sync_master_minus_disciplined_us,
+                 int64_t start_error_us, int64_t scheduler_lateness_us,
+                 int64_t start_publish_lateness_us,
+                 int64_t worst_publish_lateness_us,
+                 uint32_t frame_not_ready_count, uint64_t rtc_accepted_edges,
+                 uint64_t rtc_inferred_missing_edges, uint64_t rtc_holdover_entries) {
     if (destination == nullptr || capacity == 0 || !ValidDeviceId(device_id) ||
         bssid.size() != 17 || rtc_discipline_state.empty() ||
         rtc_discipline_state.size() > 16 || !std::isfinite(rtc_fit_rms_us) ||
-        rtc_fit_rms_us < 0.0 || rtc_fit_rms_us > 1000000.0) return -1;
+        rtc_fit_rms_us < 0.0 || rtc_fit_rms_us > 1000000.0 ||
+        !std::isfinite(rtc_rate_ppm_vs_rtc) ||
+        rtc_rate_ppm_vs_rtc < -1000000.0 || rtc_rate_ppm_vs_rtc > 1000000.0 ||
+        !std::isfinite(rtc_temperature_c) ||
+        rtc_temperature_c < -1000.0 || rtc_temperature_c > 1000.0 ||
+        health_flags > 7u) return -1;
     return std::snprintf(destination, capacity,
-                         "FCT2|STATUS|%.*s|%016llX|%s|%u|%d|%u|%.*s|%.*s|%u|%.3f|%u|%u",
+                         "FCT2|STATUS|%.*s|%016llX|%s|%u|%d|%u|%.*s|%.*s|%u|%.3f|%u|%u|%.6f|%llu|%.2f|%d|%u|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%u|%llu|%llu|%llu",
                          static_cast<int>(device_id.size()), device_id.data(),
                          static_cast<unsigned long long>(command_id), TimerStateName(state),
                          static_cast<unsigned>(remaining_seconds), rssi_dbm,
@@ -377,7 +392,22 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
                          static_cast<int>(bssid.size()), bssid.data(),
                          static_cast<int>(rtc_discipline_state.size()), rtc_discipline_state.data(),
                          static_cast<unsigned>(rtc_fit_points), rtc_fit_rms_us,
-                         static_cast<unsigned>(rtc_queue_drops), rtc_temperature_valid ? 1u : 0u);
+                         static_cast<unsigned>(rtc_queue_drops), rtc_temperature_valid ? 1u : 0u,
+                         rtc_rate_ppm_vs_rtc,
+                         static_cast<unsigned long long>(rtc_fit_outliers),
+                         rtc_temperature_c, rtc_sqw_core, static_cast<unsigned>(health_flags),
+                         static_cast<long long>(sync_source_offset_us),
+                         static_cast<long long>(sync_epoch_local_us),
+                         static_cast<long long>(sync_epoch_disciplined_us),
+                         static_cast<long long>(sync_master_minus_disciplined_us),
+                         static_cast<long long>(start_error_us),
+                         static_cast<long long>(scheduler_lateness_us),
+                         static_cast<long long>(start_publish_lateness_us),
+                         static_cast<long long>(worst_publish_lateness_us),
+                         static_cast<unsigned>(frame_not_ready_count),
+                         static_cast<unsigned long long>(rtc_accepted_edges),
+                         static_cast<unsigned long long>(rtc_inferred_missing_edges),
+                         static_cast<unsigned long long>(rtc_holdover_entries));
 }
 
 int FormatSyncReply(char* destination, std::size_t capacity, std::string_view device_id,

@@ -1,12 +1,8 @@
-v6.23.2 display frame-boundary commit
-
-Base firmware: v6.23.1 SQW robustness with DS3231 SQW ISR on core 1 and late-only fit filtering.
-Controller compatibility: v6.22.3 degraded-sync policy (unchanged).
-
-Firmware-only display changes relative to v6.23.1:
-- Exact-second ISR publishes the already-rendered framebuffer as PENDING; it no longer changes the scan-active buffer immediately.
-- Core-1 HUB75 refresh task adopts PENDING only between complete scan cycles.
-- With two framebuffers, rendering waits until that adoption before recycling the previous scan buffer. This closes the race where the old active buffer could be cleared/repainted while the refresh loop was still scanning it.
-- GPIO33 remains the logical countdown-boundary publication marker.
-- GPIO16 remains the physical refresh-boundary adoption marker.
-- DS3231 discipline, SQW core-1 logic, synchronization, START/degraded policy, network-silent RUNNING, fonts, colors, and countdown arithmetic are unchanged.
+Factory Timer ESP32 firmware
+Firmware variant: v6.23.10 CPU0 blocker attribution / historical-workload Stage B
+Baseline: v6.23.9 CPU0 latency monitor + GCC15 IRAM declaration fix
+Stage B workload: RUNNING heartbeats suppressed, matching the three historical ESP02 stall runs
+Monitor: CPU0 GPTimer 250 us, interrupt level exactly CONFIG_ESP_TIMER_INTERRUPT_LEVEL, threshold 50 us
+Positive controls: 600 us task critical-section canary at +15.5 s and 500 us same-level ISR canary at +16.5 s
+Boundary handling: samples remain active near COMMIT; only GPIO32 probe pulses are suppressed in +/-400 us guard
+Analyzer presentation offset: 0 us on ESP01 and ESP02 (no deliberate production timing skew)

@@ -1,5 +1,6 @@
 #include "factory_display.h"
 #include "display_backend.h"
+#include "cpu0_latency_monitor.h"
 #include "logo_bitmap.h"
 #include "rtc_discipline.h"
 
@@ -38,6 +39,19 @@ constexpr UBaseType_t kDisplaySchedulerPriority = 12;
 constexpr int64_t kFineLeadUs = 2000;
 constexpr int64_t kTickUs = 1000000LL / configTICK_RATE_HZ;
 constexpr uint32_t kMaxDisplayedSeconds = 99u * 60u + 59u;
+#if CONFIG_IDF_TARGET_ESP32 && defined(CONFIG_FACTORY_ANALYZER_PRESENTATION_OFFSET_US)
+constexpr int64_t kAnalyzerPresentationOffsetUs = CONFIG_FACTORY_ANALYZER_PRESENTATION_OFFSET_US;
+#else
+constexpr int64_t kAnalyzerPresentationOffsetUs = 0;
+#endif
+#if CONFIG_IDF_TARGET_ESP32
+static_assert(kAnalyzerPresentationOffsetUs == 0,
+              "v6.23.10 Stage B forbids analyzer presentation offset");
+#endif
+
+inline int64_t PresentationTargetLocalUs(int64_t nominal_local_us) {
+    return nominal_local_us + kAnalyzerPresentationOffsetUs;
+}
 
 constexpr int64_t kMarkerGapThresholdUs = 100;
 constexpr size_t kMaxRuntimeTasks = 32;
@@ -197,6 +211,32 @@ QueueHandle_t s_start_anchor_queue = nullptr;
 TaskHandle_t s_display_task = nullptr;
 std::atomic<bool> s_ready{false};
 
+// Controller-visible presentation summary. This is intentionally separate
+// from the retained diagnostic traces: it is tiny, survives until the next
+// arm/reset, and can be sampled from the command task without serial logs.
+portMUX_TYPE s_health_mux = portMUX_INITIALIZER_UNLOCKED;
+factory_display_health_t s_health_summary{};
+
+void ResetDisplayHealth(uint64_t command_id) {
+    portENTER_CRITICAL(&s_health_mux);
+    s_health_summary = {};
+    s_health_summary.command_id = command_id;
+    portEXIT_CRITICAL(&s_health_mux);
+}
+
+void UpdateDisplayHealth(uint64_t command_id,
+                         int64_t start_publish_lateness_us,
+                         int64_t worst_publish_lateness_us,
+                         uint32_t frame_not_ready_count) {
+    portENTER_CRITICAL(&s_health_mux);
+    s_health_summary.valid = true;
+    s_health_summary.command_id = command_id;
+    s_health_summary.start_publish_lateness_us = start_publish_lateness_us;
+    s_health_summary.worst_publish_lateness_us = worst_publish_lateness_us;
+    s_health_summary.frame_not_ready_count = frame_not_ready_count;
+    portEXIT_CRITICAL(&s_health_mux);
+}
+
 std::atomic<uint32_t> s_presentation_diagnostic_level{0};
 BoundaryTraceRecord s_boundary_trace[kBoundaryTraceCapacity]{};
 size_t s_boundary_trace_count = 0;
@@ -320,6 +360,12 @@ void IRAM_ATTR BoundaryPublishTimerCallback(void*) {
         s_isr_last_sample.marker_level = static_cast<uint8_t>(
             s_presentation_diagnostic_level.load(std::memory_order_relaxed));
         s_isr_last_sample.published = true;
+        cpu0_latency_monitor_note_commit(
+            s_isr_last_sample.boundary,
+            s_isr_last_sample.target_local_us,
+            callback_entry_us,
+            begin_us,
+            end_us);
     } else {
         s_frame_not_ready_count.fetch_add(1U, std::memory_order_relaxed);
     }
@@ -358,6 +404,8 @@ bool ArmBoundaryPublish(uint32_t boundary,
                         int64_t target_local_us,
                         int64_t* arm_us_out) {
     if (s_boundary_publish_timer == nullptr) return false;
+    target_local_us = PresentationTargetLocalUs(target_local_us);
+    cpu0_latency_monitor_set_commit_target(target_local_us);
     if (esp_timer_is_active(s_boundary_publish_timer)) {
         (void)esp_timer_stop(s_boundary_publish_timer);
     }
@@ -1185,7 +1233,9 @@ void DisplayTask(void*) {
         if (command.type == DisplayCommand::Type::Reset) {
 #if CONFIG_IDF_TARGET_ESP32
             CancelBoundaryPublishTimer();
+            cpu0_latency_monitor_end_run();
 #endif
+            ResetDisplayHealth(0);
             SetPresentationDiagnosticEdge(false);
             RenderIdleToBackBuffer();
             factory_display_backend_flip();
@@ -1210,6 +1260,7 @@ void DisplayTask(void*) {
         // before the prepared START frame is armed.
         ResetIsrPublishTrace();
 #endif
+        ResetDisplayHealth(command.command_id);
 
         // Make the idle/device ID frame visible while armed, then pre-render
         // the first countdown frame. Nothing visible changes until deadline.
@@ -1221,6 +1272,9 @@ void DisplayTask(void*) {
         // before START. The expensive system-state enumeration therefore never
         // runs in the precision window.
         RefreshRuntimeTaskInventory();
+#if CONFIG_IDF_TARGET_ESP32
+        cpu0_latency_monitor_prepare_run(command.command_id);
+#endif
 
         DisplayCommand replacement{};
 
@@ -1245,7 +1299,7 @@ void DisplayTask(void*) {
                                 command.local_start_us,
                                 &start_arm_us)) {
             ESP_LOGE(kTag, "START display ISR timer arm failed; falling back to task publication");
-            if (!WaitUntilOrReplacement(command.local_start_us, &replacement)) {
+            if (!WaitUntilOrReplacement(PresentationTargetLocalUs(command.local_start_us), &replacement)) {
                 command = replacement;
                 xQueueOverwrite(s_command_queue, &command);
                 continue;
@@ -1258,20 +1312,20 @@ void DisplayTask(void*) {
             fallback.boundary = 0;
             fallback.sequence = start_sequence;
             fallback.disciplined_us = fallback_start_disciplined_us;
-            fallback.target_local_us = command.local_start_us;
+            fallback.target_local_us = PresentationTargetLocalUs(command.local_start_us);
             fallback.arm_us = start_arm_us;
             fallback.callback_entry_us = begin_us;
             fallback.publish_marker_begin_us = begin_us;
             fallback.publish_marker_end_us = end_us;
             fallback.callback_exit_us = end_us;
-            fallback.post_local_us = command.local_start_us;
+            fallback.post_local_us = PresentationTargetLocalUs(command.local_start_us);
             fallback.prepared_sequence = start_sequence;
             fallback.published_sequence = start_sequence;
             fallback.marker_level = static_cast<uint8_t>(
                 s_presentation_diagnostic_level.load(std::memory_order_relaxed));
             fallback.published = true;
             RetainIsrPublishTraceRecord(fallback);
-            commit_lateness_us = end_us - command.local_start_us;
+            commit_lateness_us = end_us - PresentationTargetLocalUs(command.local_start_us);
         } else {
             if (!WaitForBoundaryPublishOrReplacement(start_sequence, &replacement)) {
                 command = replacement;
@@ -1283,24 +1337,25 @@ void DisplayTask(void*) {
             RecordIsrPublishTrace(0,
                                   start_sequence,
                                   fallback_start_disciplined_us,
-                                  command.local_start_us,
+                                  PresentationTargetLocalUs(command.local_start_us),
                                   start_arm_us,
-                                  start_post_local_us);
+                                  PresentationTargetLocalUs(start_post_local_us));
             const IsrPublishTraceRecord start_sample = s_isr_last_sample;
             commit_lateness_us = start_sample.published
-                ? start_sample.publish_marker_end_us - command.local_start_us
-                : start_sample.callback_exit_us - command.local_start_us;
+                ? start_sample.publish_marker_end_us - PresentationTargetLocalUs(command.local_start_us)
+                : start_sample.callback_exit_us - PresentationTargetLocalUs(command.local_start_us);
         }
         s_prepared_sequence.store(0, std::memory_order_release);
 
         ReceiveStartAnchor(command.command_id,
                            fallback_start_disciplined_us,
                            &start_disciplined_us);
+        cpu0_latency_monitor_begin_run(command.command_id, start_disciplined_us);
 
         ESP_LOGI(kTag,
                  "Visual countdown started: duration=%u target_local_us=%lld start_isr_publish_lateness_us=%lld frame_not_ready=%u",
                  static_cast<unsigned>(command.duration_seconds),
-                 static_cast<long long>(command.local_start_us),
+                 static_cast<long long>(PresentationTargetLocalUs(command.local_start_us)),
                  static_cast<long long>(commit_lateness_us),
                  static_cast<unsigned>(s_frame_not_ready_count.load(std::memory_order_relaxed)));
 
@@ -1341,6 +1396,19 @@ void DisplayTask(void*) {
 #endif
 
 #if CONFIG_IDF_TARGET_ESP32
+        UpdateDisplayHealth(
+            command.command_id,
+            commit_lateness_us,
+            worst_boundary_publish_lateness_us,
+            s_frame_not_ready_count.load(std::memory_order_relaxed));
+#else
+        UpdateDisplayHealth(command.command_id,
+                            commit_lateness_us,
+                            worst_flip_lateness_us,
+                            0);
+#endif
+
+#if CONFIG_IDF_TARGET_ESP32
         for (uint32_t elapsed = 1; elapsed <= command.duration_seconds; ++elapsed) {
             const uint32_t remaining = command.duration_seconds - elapsed;
             if (remaining == 0) {
@@ -1373,14 +1441,14 @@ void DisplayTask(void*) {
                 fallback.boundary = elapsed;
                 fallback.sequence = sequence;
                 fallback.disciplined_us = boundary_disciplined_us;
-                fallback.target_local_us = boundary_local_us;
+                fallback.target_local_us = PresentationTargetLocalUs(boundary_local_us);
                 fallback.arm_us = arm_us;
                 fallback.callback_entry_us = fallback_begin_us;
                 fallback.publish_marker_begin_us = fallback_begin_us;
                 fallback.publish_marker_end_us = fallback_end_us;
                 fallback.callback_exit_us = fallback_end_us;
-                fallback.post_local_us =
-                    rtc_discipline_disciplined_to_local_us(boundary_disciplined_us);
+                fallback.post_local_us = PresentationTargetLocalUs(
+                    rtc_discipline_disciplined_to_local_us(boundary_disciplined_us));
                 fallback.prepared_sequence = sequence;
                 fallback.published_sequence = sequence;
                 fallback.marker_level = static_cast<uint8_t>(
@@ -1388,7 +1456,8 @@ void DisplayTask(void*) {
                 fallback.published = true;
                 RetainIsrPublishTraceRecord(fallback);
                 worst_boundary_publish_lateness_us = std::max(
-                    worst_boundary_publish_lateness_us, fallback_end_us - boundary_local_us);
+                    worst_boundary_publish_lateness_us,
+                    fallback_end_us - PresentationTargetLocalUs(boundary_local_us));
                 s_prepared_sequence.store(0, std::memory_order_release);
                 continue;
             }
@@ -1405,15 +1474,20 @@ void DisplayTask(void*) {
             RecordIsrPublishTrace(elapsed,
                                   sequence,
                                   boundary_disciplined_us,
-                                  boundary_local_us,
+                                  PresentationTargetLocalUs(boundary_local_us),
                                   arm_us,
-                                  post_local_us);
+                                  PresentationTargetLocalUs(post_local_us));
             const IsrPublishTraceRecord sample = s_isr_last_sample;
             if (sample.published) {
                 worst_boundary_publish_lateness_us = std::max(
                     worst_boundary_publish_lateness_us,
-                    sample.publish_marker_end_us - boundary_local_us);
+                    sample.publish_marker_end_us - PresentationTargetLocalUs(boundary_local_us));
             }
+            UpdateDisplayHealth(
+                command.command_id,
+                commit_lateness_us,
+                worst_boundary_publish_lateness_us,
+                s_frame_not_ready_count.load(std::memory_order_relaxed));
             s_prepared_sequence.store(0, std::memory_order_release);
         }
 #else
@@ -1485,10 +1559,29 @@ void DisplayTask(void*) {
             boundary_local_us = post_local_deadline_us;
             worst_flip_lateness_us = std::max(worst_flip_lateness_us,
                                                flip_commit_us - boundary_local_us);
+            UpdateDisplayHealth(command.command_id,
+                                commit_lateness_us,
+                                worst_flip_lateness_us,
+                                0);
         }
 
 #endif
+#if CONFIG_IDF_TARGET_ESP32
+        cpu0_latency_monitor_end_run();
+#endif
         if (!superseded) {
+#if CONFIG_IDF_TARGET_ESP32
+            UpdateDisplayHealth(
+                command.command_id,
+                commit_lateness_us,
+                worst_boundary_publish_lateness_us,
+                s_frame_not_ready_count.load(std::memory_order_relaxed));
+#else
+            UpdateDisplayHealth(command.command_id,
+                                commit_lateness_us,
+                                worst_flip_lateness_us,
+                                0);
+#endif
 #if CONFIG_IDF_TARGET_ESP32
             ESP_LOGI(kTag,
                      "Visual countdown finished: duration=%u start_isr_publish_lateness_us=%lld worst_isr_publish_marker_lateness_us=%lld frame_not_ready=%u",
@@ -1506,6 +1599,7 @@ void DisplayTask(void*) {
             // the precision path.
 #if CONFIG_IDF_TARGET_ESP32
             DumpIsrPublishTrace();
+            cpu0_latency_monitor_dump_run();
 #else
             DumpBoundaryTrace();
             DumpCommitDelayDiagnostics();
@@ -1542,6 +1636,12 @@ extern "C" bool factory_display_init(const char* device_id, uint8_t brightness) 
         ESP_LOGE(kTag, "HUB75 backend initialization failed");
         return false;
     }
+#if CONFIG_IDF_TARGET_ESP32
+    if (!cpu0_latency_monitor_init()) {
+        ESP_LOGE(kTag, "CPU0 latency monitor initialization failed");
+        return false;
+    }
+#endif
 
     s_command_queue = xQueueCreate(1, sizeof(DisplayCommand));
     s_start_anchor_queue = xQueueCreate(1, sizeof(DisplayStartAnchor));
@@ -1564,16 +1664,22 @@ extern "C" bool factory_display_init(const char* device_id, uint8_t brightness) 
         return false;
     }
     ESP_LOGI(kTag,
-             "ISR frame publication enabled: esp_timer_dispatch=ISR prepared_frame_sequence_guard=1 active_frame_publish=pending_refresh_boundary");
+             "ISR frame publication enabled: esp_timer_dispatch=ISR prepared_frame_sequence_guard=1 active_frame_publish=pending_refresh_boundary analyzer_presentation_offset_us=%lld",
+             static_cast<long long>(kAnalyzerPresentationOffsetUs));
 #endif
 
 #if FACTORY_MARKER_GAP_RUNTIME_DIAGNOSTICS
+#if CONFIG_IDF_TARGET_ESP32
+    ESP_LOGI(kTag,
+             "Marker-gap task-path diagnostics retained for legacy analysis; classic-ESP32 ISR pre-entry lateness is monitored by CPU0 GPTimer");
+#else
     ESP_LOGI(kTag,
              "Marker-gap diagnostics enabled: threshold_us=%lld runtime_stats=esp_timer buffered_until_run_end=1 commit_delay_runtime_snapshots=precision-entry-to-post-marker",
              static_cast<long long>(kMarkerGapThresholdUs));
     ESP_LOGI(kTag,
              "Inverse-mapping boundary trace enabled: capacity=%u buffered_until_run_end=1",
              static_cast<unsigned>(kBoundaryTraceCapacity));
+#endif
 #endif
 
     // Establish a known visible idle frame before the scheduler task starts.
@@ -1649,4 +1755,11 @@ extern "C" void factory_display_reset(void) {
 #if CONFIG_IDF_TARGET_ESP32
     if (s_display_task != nullptr) xTaskNotifyGive(s_display_task);
 #endif
+}
+
+extern "C" void factory_display_get_health(factory_display_health_t* out_health) {
+    if (out_health == nullptr) return;
+    portENTER_CRITICAL(&s_health_mux);
+    *out_health = s_health_summary;
+    portEXIT_CRITICAL(&s_health_mux);
 }

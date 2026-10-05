@@ -183,10 +183,24 @@ void CheckProtocolFormats() {
     int length = factory_timer::FormatStatus(
         packet, sizeof(packet), "ESP03", 0x0123456789abcdefULL,
         factory_timer::TimerState::Running, 19, -57, 6, "AA:BB:CC:DD:EE:FF", "LOCKED",
-        129, 0.785, 0, true);
+        129, 0.785, 0, true, -6.500001, 2, 25.25, 1, 0x07,
+        -987654, 7654321, 7654000, -987333, 0, 0, 28, 49, 0,
+        12345, 0, 0);
     CHECK(length > 0);
     CHECK(std::string_view(packet, static_cast<std::size_t>(length)) ==
-          "FCT2|STATUS|ESP03|0123456789ABCDEF|RUNNING|19|-57|6|AA:BB:CC:DD:EE:FF|LOCKED|129|0.785|0|1");
+          "FCT2|STATUS|ESP03|0123456789ABCDEF|RUNNING|19|-57|6|AA:BB:CC:DD:EE:FF|LOCKED|129|0.785|0|1|-6.500001|2|25.25|1|7|-987654|7654321|7654000|-987333|0|0|28|49|0|12345|0|0");
+
+    // The extended fleet-health STATUS must still fit inside the advertised
+    // protocol envelope even at conservative numeric extremes.
+    length = factory_timer::FormatStatus(
+        packet, sizeof(packet), "ESP1234567890123", UINT64_MAX,
+        factory_timer::TimerState::Finished, factory_timer::kMaxDurationSeconds,
+        -127, 255, "FF:FF:FF:FF:FF:FF", "UNINITIALIZED", UINT16_MAX,
+        1000000.0, UINT32_MAX, true, -1000000.0, UINT64_MAX, -1000.0, -1, 0x07,
+        INT64_MIN, INT64_MAX, INT64_MAX, INT64_MIN, INT64_MIN, INT64_MIN,
+        INT64_MIN, INT64_MIN, UINT32_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX);
+    CHECK(length > 0);
+    CHECK(static_cast<std::size_t>(length) <= factory_timer::kMaxPacketLength);
 
     length = factory_timer::FormatSyncReply(
         packet, sizeof(packet), "ESP02", 0x0123456789abcdefULL,

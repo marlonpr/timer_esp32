@@ -49,6 +49,9 @@ typedef struct {
     double fit_last_outlier_residual_us;
     double fit_max_abs_outlier_residual_us;
     uint64_t inferred_missing_edges;
+    /* Number of transitions into HOLDOVER since boot. Used by fleet
+     * qualification to reject intervals that were not continuously RTC-referenced. */
+    uint64_t holdover_entries;
     uint32_t isr_queue_drops;
     int64_t last_edge_local_us;
     double local_us_per_rtc_second;

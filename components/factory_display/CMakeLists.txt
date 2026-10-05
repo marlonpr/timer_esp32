@@ -1,5 +1,6 @@
 set(FACTORY_DISPLAY_SRCS
     "factory_display.cpp"
+    "cpu0_latency_monitor.cpp"
     "logo_bitmap.cpp"
 )
 
@@ -10,6 +11,7 @@ if(IDF_TARGET STREQUAL "esp32")
     set(FACTORY_DISPLAY_REQUIRES
         esp_driver_gpio
         esp_driver_ledc
+        esp_driver_gptimer
         esp_timer
         esp_system
     )

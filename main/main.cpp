@@ -1,6 +1,7 @@
 #include "command_processor.h"
 #include "factory_log.h"
 #include "factory_display.h"
+#include "flash_guard_diag.h"
 #include "network_policy.h"
 #include "protocol_codec.h"
 #include "ds3231.h"
@@ -139,6 +140,15 @@ struct ClockSyncState {
 };
 
 ClockSyncState clock_sync;
+
+struct StartHealthState {
+    bool valid{};
+    uint64_t command_id{};
+    int64_t start_error_us{};
+    int64_t scheduler_lateness_us{};
+};
+
+StartHealthState last_start_health;
 
 struct ScheduledStartMetadata {
     bool valid{};
@@ -507,7 +517,7 @@ void RtcQualificationTask(void *) {
         rtc_discipline_get_status(&status);
 
         ESP_LOGI(kTag,
-                 "RTC_QUAL device=%s local_us=%lld disciplined_us=%lld state=%s rate_ppm=%+.6f rms_us=%.3f points=%u accepted=%llu rejected=%llu fit_outliers=%llu fit_last_outlier_us=%+.3f fit_max_outlier_us=%.3f inferred_missing=%llu queue_drops=%u temp_valid=%u temp_c=%.2f sqw_core=%d sqw_n=%u sqw_last_period_us=%lld sqw_period_mean_us=%.3f sqw_period_rms_us=%.3f sqw_period_p2p_us=%.3f sqw_trace_n=%u sqw_trace_overwrites=%u",
+                 "RTC_QUAL device=%s local_us=%lld disciplined_us=%lld state=%s rate_ppm=%+.6f rms_us=%.3f points=%u accepted=%llu rejected=%llu fit_outliers=%llu fit_last_outlier_us=%+.3f fit_max_outlier_us=%.3f inferred_missing=%llu holdover_entries=%llu queue_drops=%u temp_valid=%u temp_c=%.2f sqw_core=%d sqw_n=%u sqw_last_period_us=%lld sqw_period_mean_us=%.3f sqw_period_rms_us=%.3f sqw_period_p2p_us=%.3f sqw_trace_n=%u sqw_trace_overwrites=%u",
                  CONFIG_FACTORY_DEVICE_ID,
                  static_cast<long long>(local_us),
                  static_cast<long long>(disciplined_us),
@@ -521,6 +531,7 @@ void RtcQualificationTask(void *) {
                  status.fit_last_outlier_residual_us,
                  status.fit_max_abs_outlier_residual_us,
                  static_cast<unsigned long long>(status.inferred_missing_edges),
+                 static_cast<unsigned long long>(status.holdover_entries),
                  static_cast<unsigned>(status.isr_queue_drops),
                  status.rtc_temperature_valid ? 1u : 0u,
                  status.rtc_temperature_valid
@@ -704,6 +715,13 @@ struct RtcStatusFields {
     double fit_rms_us = 0.0;
     uint32_t queue_drops = 0;
     bool temperature_valid = false;
+    double rate_ppm_vs_rtc = 0.0;
+    uint64_t fit_outliers = 0;
+    uint64_t accepted_edges = 0;
+    uint64_t inferred_missing_edges = 0;
+    uint64_t holdover_entries = 0;
+    double temperature_c = 0.0;
+    int sqw_core = -1;
 };
 
 RtcStatusFields CurrentRtcStatusFields() {
@@ -720,6 +738,15 @@ RtcStatusFields CurrentRtcStatusFields() {
     fields.fit_rms_us = status.fit_rms_us;
     fields.queue_drops = status.isr_queue_drops;
     fields.temperature_valid = status.rtc_temperature_valid;
+    fields.rate_ppm_vs_rtc = status.local_rate_ppm_vs_rtc;
+    fields.fit_outliers = status.fit_outlier_edges;
+    fields.accepted_edges = status.accepted_edges;
+    fields.inferred_missing_edges = status.inferred_missing_edges;
+    fields.holdover_entries = status.holdover_entries;
+    fields.temperature_c = status.rtc_temperature_valid
+        ? static_cast<double>(status.rtc_temperature_c)
+        : 0.0;
+    fields.sqw_core = status.sqw_isr_core_id;
 #endif
     return fields;
 }
@@ -756,13 +783,58 @@ void SendStatus(int socket_fd, const sockaddr_in &peer,
     if (timing != nullptr) timing->rtc_state_begin_us = esp_timer_get_time();
     const RtcStatusFields rtc = CurrentRtcStatusFields();
     if (timing != nullptr) timing->rtc_state_end_us = esp_timer_get_time();
+    uint8_t health_flags = 0;
+    int64_t sync_source_offset_us = 0;
+    int64_t sync_epoch_local_us = 0;
+    int64_t sync_epoch_disciplined_us = 0;
+    int64_t sync_master_minus_disciplined_us = 0;
+    if (clock_sync.valid.load(std::memory_order_acquire) &&
+        clock_sync.offset_epoch_local_us > 0 &&
+        clock_sync.offset_epoch_disciplined_us > 0) {
+        health_flags |= 0x01u;
+        sync_source_offset_us = clock_sync.source_offset_us;
+        sync_epoch_local_us = clock_sync.offset_epoch_local_us;
+        sync_epoch_disciplined_us = clock_sync.offset_epoch_disciplined_us;
+        sync_master_minus_disciplined_us =
+            sync_source_offset_us + sync_epoch_local_us - sync_epoch_disciplined_us;
+    }
+
+    int64_t start_error_us = 0;
+    int64_t scheduler_lateness_us = 0;
+    if (last_start_health.valid &&
+        last_start_health.command_id == snapshot.last_command_id) {
+        health_flags |= 0x02u;
+        start_error_us = last_start_health.start_error_us;
+        scheduler_lateness_us = last_start_health.scheduler_lateness_us;
+    }
+
+    factory_display_health_t display_health{};
+#if defined(CONFIG_FACTORY_DISPLAY_TEST) && CONFIG_FACTORY_DISPLAY_TEST
+    factory_display_get_health(&display_health);
+#endif
+    int64_t start_publish_lateness_us = 0;
+    int64_t worst_publish_lateness_us = 0;
+    uint32_t frame_not_ready_count = 0;
+    if (display_health.valid && display_health.command_id == snapshot.last_command_id) {
+        health_flags |= 0x04u;
+        start_publish_lateness_us = display_health.start_publish_lateness_us;
+        worst_publish_lateness_us = display_health.worst_publish_lateness_us;
+        frame_not_ready_count = display_health.frame_not_ready_count;
+    }
+
     char packet[factory_timer::kMaxPacketLength + 1]{};
     const int length = factory_timer::FormatStatus(
         packet, sizeof(packet), CONFIG_FACTORY_DEVICE_ID,
         snapshot.last_command_id, snapshot.state, snapshot.remaining_seconds,
         diagnostics.rssi_dbm, diagnostics.channel, diagnostics.bssid,
         rtc.state, rtc.fit_points, rtc.fit_rms_us, rtc.queue_drops,
-        rtc.temperature_valid);
+        rtc.temperature_valid, rtc.rate_ppm_vs_rtc, rtc.fit_outliers,
+        rtc.temperature_c, rtc.sqw_core, health_flags,
+        sync_source_offset_us, sync_epoch_local_us, sync_epoch_disciplined_us,
+        sync_master_minus_disciplined_us, start_error_us, scheduler_lateness_us,
+        start_publish_lateness_us, worst_publish_lateness_us,
+        frame_not_ready_count, rtc.accepted_edges, rtc.inferred_missing_edges,
+        rtc.holdover_entries);
     if (timing != nullptr) timing->format_done_us = esp_timer_get_time();
     SendPacket(socket_fd, peer, packet, length, "STATUS",
                timing != nullptr ? &timing->sendto_entry_us : nullptr,
@@ -1189,6 +1261,12 @@ void TimerTask(void *) {
                                              event.actual_disciplined_start_us);
             }
 #endif
+            if (started) {
+                // Positive-control diagnostics are launched only after the exact
+                // Armed -> Running transition and never execute NVS work here.
+                flash_guard_diag_countdown_started(
+                    event.snapshot.last_command_id, event.actual_local_start_us);
+            }
 
             if (!started) {
                 // State or target changed on the other core while we were in
@@ -1485,6 +1563,7 @@ void DiagnosticDumpTask(void *) {
         DumpSyncReplyTrace();
         rtc_discipline_dump_sqw_trace();
         DumpNetworkTimingDiagnostics();
+        flash_guard_diag_dump_run();
         const int64_t end_us = esp_timer_get_time();
         ESP_LOGI(kTag,
                  "POST_RUN_DIAG_END local_us=%lld duration_us=%lld command_task_blocked=0",
@@ -1597,6 +1676,9 @@ void LogAcceptedCommand(const factory_timer::CommandPacket &command,
     if (result != factory_timer::AckResult::Accepted) return;
 
     if (command.type == factory_timer::CommandType::StartAt) {
+        // Diagnostic baseline is taken after START_AT has already been accepted
+        // and scheduled. It does not participate in the deadline/ISR path.
+        flash_guard_diag_begin_run(command.command_id, local_start_us);
         ESP_LOGI(kTag,
                  "Absolute countdown accepted: duration=%u target_master_us=%lld local_start_us=%lld command=%016llX",
                  static_cast<unsigned>(command.duration_seconds),
@@ -1728,17 +1810,22 @@ void CommandTask(void *) {
                     clock_sync.valid.store(true, std::memory_order_release);
                     SendSyncApplied(socket_fd, peer, packet.sync_set);
                     ESP_LOGI(kTag,
-                             "Clock synchronized: offset_master_minus_local_us=%lld best_rtt_us=%llu sync=%016llX source_offset_us=%lld offset_epoch_local_us=%lld",
+                             "Clock synchronized: offset_master_minus_local_us=%lld best_rtt_us=%llu sync=%016llX source_offset_us=%lld offset_epoch_local_us=%lld offset_epoch_disciplined_us=%lld offset_master_minus_disciplined_us=%lld",
                              static_cast<long long>(clock_sync.master_minus_local_offset_us),
                              static_cast<unsigned long long>(clock_sync.best_rtt_us),
                              static_cast<unsigned long long>(clock_sync.sync_id),
                              static_cast<long long>(clock_sync.source_offset_us),
-                             static_cast<long long>(clock_sync.offset_epoch_local_us));
+                             static_cast<long long>(clock_sync.offset_epoch_local_us),
+                             static_cast<long long>(clock_sync.offset_epoch_disciplined_us),
+                             static_cast<long long>(
+                                 clock_sync.source_offset_us +
+                                 clock_sync.offset_epoch_local_us -
+                                 clock_sync.offset_epoch_disciplined_us));
 #if defined(CONFIG_FACTORY_RTC_QUAL_LOGS) && CONFIG_FACTORY_RTC_QUAL_LOGS
                     rtc_discipline_status_t rtc_status{};
                     rtc_discipline_get_status(&rtc_status);
                     ESP_LOGI(kTag,
-                             "RTC_SYNC_QUAL device=%s sync=%016llX local_us=%lld estimated_master_us=%lld offset_master_minus_local_us=%lld best_rtt_us=%llu state=%s rate_ppm=%+.6f rms_us=%.3f points=%u temp_valid=%u temp_c=%.2f source_offset_us=%lld offset_epoch_local_us=%lld",
+                             "RTC_SYNC_QUAL device=%s sync=%016llX local_us=%lld estimated_master_us=%lld offset_master_minus_local_us=%lld best_rtt_us=%llu state=%s rate_ppm=%+.6f rms_us=%.3f points=%u temp_valid=%u temp_c=%.2f source_offset_us=%lld offset_epoch_local_us=%lld offset_epoch_disciplined_us=%lld offset_master_minus_disciplined_us=%lld",
                              CONFIG_FACTORY_DEVICE_ID,
                              static_cast<unsigned long long>(clock_sync.sync_id),
                              static_cast<long long>(clock_sync.applied_local_us),
@@ -1754,7 +1841,12 @@ void CommandTask(void *) {
                                  ? static_cast<double>(rtc_status.rtc_temperature_c)
                                  : 0.0,
                              static_cast<long long>(clock_sync.source_offset_us),
-                             static_cast<long long>(clock_sync.offset_epoch_local_us));
+                             static_cast<long long>(clock_sync.offset_epoch_local_us),
+                             static_cast<long long>(clock_sync.offset_epoch_disciplined_us),
+                             static_cast<long long>(
+                                 clock_sync.source_offset_us +
+                                 clock_sync.offset_epoch_local_us -
+                                 clock_sync.offset_epoch_disciplined_us));
 #endif
                 } else {
                     const auto &command = packet.command;
@@ -1857,6 +1949,8 @@ void CommandTask(void *) {
                         if (processing.ack_result == factory_timer::AckResult::Accepted) {
                             if (command.type == factory_timer::CommandType::StartAt ||
                                 command.type == factory_timer::CommandType::Start) {
+                                last_start_health = {};
+                                last_start_health.command_id = command.command_id;
                                 scheduled_start_metadata.valid = true;
                                 scheduled_start_metadata.peer = peer;
                                 scheduled_start_metadata.have_peer = true;
@@ -1910,6 +2004,7 @@ void CommandTask(void *) {
                                                     command.command_id);
 #endif
                             } else if (command.type == factory_timer::CommandType::Reset) {
+                                last_start_health = {};
                                 SetStartDiagnosticEdge(false);
 #if defined(CONFIG_FACTORY_DISPLAY_TEST) && CONFIG_FACTORY_DISPLAY_TEST
                                 factory_display_reset();
@@ -1960,6 +2055,17 @@ void CommandTask(void *) {
         TimerStartEvent timer_event{};
         while (xQueueReceive(timer_event_queue, &timer_event, 0) == pdTRUE) {
             const int64_t deferred_log_us = esp_timer_get_time();
+            const int64_t start_error_us =
+                timer_event.target_master_start_us > 0
+                    ? timer_event.estimated_master_start_us - timer_event.target_master_start_us
+                    : 0;
+            const int64_t scheduler_lateness_us =
+                timer_event.actual_local_start_us - timer_event.target_local_start_us;
+            last_start_health.valid = timer_event.target_master_start_us > 0;
+            last_start_health.command_id = timer_event.snapshot.last_command_id;
+            last_start_health.start_error_us = start_error_us;
+            last_start_health.scheduler_lateness_us = scheduler_lateness_us;
+
             ESP_LOGI(kTag,
                      "Countdown started: remaining=%u command=%016llX local_us=%lld disciplined_us=%lld estimated_master_us=%lld scheduler_lateness_us=%lld deferred_log_delay_us=%lld",
                      static_cast<unsigned>(timer_event.snapshot.remaining_seconds),
@@ -1967,25 +2073,18 @@ void CommandTask(void *) {
                      static_cast<long long>(timer_event.actual_local_start_us),
                      static_cast<long long>(timer_event.actual_disciplined_start_us),
                      static_cast<long long>(timer_event.estimated_master_start_us),
-                     static_cast<long long>(timer_event.actual_local_start_us -
-                                            timer_event.target_local_start_us),
+                     static_cast<long long>(scheduler_lateness_us),
                      static_cast<long long>(deferred_log_us -
                                             timer_event.actual_local_start_us));
 
 #if defined(CONFIG_FACTORY_RTC_QUAL_LOGS) && CONFIG_FACTORY_RTC_QUAL_LOGS
             if (timer_event.target_master_start_us > 0 &&
                 timer_event.sync_applied_local_us > 0) {
-                const int64_t start_error_us =
-                    timer_event.estimated_master_start_us -
-                    timer_event.target_master_start_us;
-                const int64_t scheduler_lateness_us =
-                    timer_event.actual_local_start_us -
-                    timer_event.target_local_start_us;
                 const int64_t sync_age_local_us =
                     timer_event.actual_local_start_us -
                     timer_event.sync_applied_local_us;
                 ESP_LOGI(kTag,
-                         "RTC_START_QUAL device=%s command=%016llX sync=%016llX sync_local_us=%lld sync_estimated_master_us=%lld offset_master_minus_local_us=%lld best_rtt_us=%llu target_master_us=%lld actual_local_us=%lld estimated_master_us=%lld start_error_us=%lld scheduler_lateness_us=%lld sync_age_local_us=%lld disciplined_start_us=%lld source_offset_us=%lld offset_epoch_local_us=%lld",
+                         "RTC_START_QUAL device=%s command=%016llX sync=%016llX sync_local_us=%lld sync_estimated_master_us=%lld offset_master_minus_local_us=%lld best_rtt_us=%llu target_master_us=%lld actual_local_us=%lld estimated_master_us=%lld start_error_us=%lld scheduler_lateness_us=%lld sync_age_local_us=%lld disciplined_start_us=%lld source_offset_us=%lld offset_epoch_local_us=%lld offset_epoch_disciplined_us=%lld offset_master_minus_disciplined_us=%lld",
                          CONFIG_FACTORY_DEVICE_ID,
                          static_cast<unsigned long long>(timer_event.snapshot.last_command_id),
                          static_cast<unsigned long long>(timer_event.sync_id),
@@ -2001,7 +2100,12 @@ void CommandTask(void *) {
                          static_cast<long long>(sync_age_local_us),
                          static_cast<long long>(timer_event.actual_disciplined_start_us),
                          static_cast<long long>(timer_event.source_offset_us),
-                         static_cast<long long>(timer_event.offset_epoch_local_us));
+                         static_cast<long long>(timer_event.offset_epoch_local_us),
+                         static_cast<long long>(timer_event.offset_epoch_disciplined_us),
+                         static_cast<long long>(
+                             timer_event.source_offset_us +
+                             timer_event.offset_epoch_local_us -
+                             timer_event.offset_epoch_disciplined_us));
             }
 #endif
 
@@ -2054,6 +2158,7 @@ void CommandTask(void *) {
             } else if (snapshot.state == factory_timer::TimerState::Finished) {
                 ESP_LOGI(kTag, "Countdown finished: command=%016llX",
                          static_cast<unsigned long long>(snapshot.last_command_id));
+                flash_guard_diag_countdown_finished();
                 RequestPostRunDiagnosticDump();
             }
             bool status_sent = false;
@@ -2153,6 +2258,7 @@ extern "C" void app_main() {
     ESP_LOGI(kTag, "Factory countdown timer starting");
     ESP_LOGI(kTag, "Configured device identity: %s", CONFIG_FACTORY_DEVICE_ID);
     InitialiseNvs();
+    flash_guard_diag_init();
     InitialiseDieTemperatureSensor();
     InitialiseRtcDiscipline();
 #if defined(CONFIG_FACTORY_RTC_QUAL_LOGS) && CONFIG_FACTORY_RTC_QUAL_LOGS

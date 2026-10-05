@@ -131,6 +131,140 @@ config FACTORY_RX_BOUNDARY_TRACE
         outside this application-level trace.
 
 
+config FACTORY_FLASH_GUARD_DIAGNOSTICS
+    bool "Trace main esp_flash cache-disabled windows"
+    default n
+    help
+        Temporary qualification diagnostic. Wraps the main flash chip's
+        esp_flash OS start/end callbacks after NVS initialization. This is the
+        actual path used by NVS in ESP-IDF v6.0. IRAM/DRAM-only timestamps are
+        retained while cache is disabled and dumped only after the countdown.
+
+config FACTORY_FLASH_GUARD_EVENT_THRESHOLD_US
+    int "Flash-guard event retention threshold (microseconds)"
+    range 0 1000000
+    default 0
+    depends on FACTORY_FLASH_GUARD_DIAGNOSTICS
+    help
+        Cache-disabled windows at or above this duration are retained in a 256-entry
+        RAM ring for post-run correlation with callback_lateness_us and Analyzer
+        COMMIT timestamps. v6.23.8 uses 0 us so every observed window is retained.
+
+
+config FACTORY_TIMING_PROBE_OUTPUT
+    bool "Drive diagnostic blocking-window probe GPIO"
+    default n
+    depends on FACTORY_FLASH_GUARD_DIAGNOSTICS && IDF_TARGET_ESP32
+    help
+        Diagnostic-only output. The probe is HIGH during every wrapped esp_flash
+        cache-off window and during the v6.23.8 injected cache/critical-section
+        controls. Connect ESP02 GPIO32 to Analyzer_v8 channel 4 (normally labeled
+        ESP02_SQW) for this test. ESP02 START-edge diagnostics are disabled in
+        this diagnostic profile because GPIO32 is dedicated to this probe. Do not use in production.
+
+config FACTORY_TIMING_PROBE_GPIO
+    int "Blocking-window probe GPIO"
+    range 0 33
+    default 32
+    depends on FACTORY_TIMING_PROBE_OUTPUT
+    help
+        GPIO32 is dedicated to the v6.23.8 ESP02 blocking-window probe. GPIO0..31
+        use GPIO_OUT_W1TS/W1TC; GPIO32..33 use GPIO_OUT1_W1TS/W1TC so the probe
+        remains IRAM/cache-safe. The ESP02 START-edge marker is disabled to avoid
+        a GPIO32 conflict.
+
+config FACTORY_TIMING_MECHANISM_TEST
+    bool "Inject deterministic cache-off / CPU critical-section controls"
+    default n
+    depends on FACTORY_TIMING_PROBE_OUTPUT && IDF_TARGET_ESP32
+    help
+        v6.23.8 diagnostic-only mechanism test on ESP02. During a RUNNING countdown:
+          boundary 30: 1000 us cache-off window centered on the edge
+          boundary 60: 300 us private critical section on CPU0, starting 100 us early
+          boundary 90: 300 us private critical section on CPU1, starting 100 us early
+        The protected interval is visible on the timing-probe GPIO. This is a positive
+        control for the Analyzer and ISR-lateness telemetry; never enable in production.
+
+
+config FACTORY_CPU0_LATENCY_MONITOR
+    bool "Enable CPU0 GPTimer interrupt-latency monitor"
+    default n
+    depends on IDF_TARGET_ESP32
+    help
+        Diagnostic-only v6.23.9 monitor. A level-1 GPTimer alarm runs on CPU0
+        at 4 kHz and retains only lateness excursions above the configured
+        threshold. The monitor stores the interrupted task handle, suppresses
+        sampling alarms around exact COMMIT deadlines, and dumps buffered events
+        only after the countdown. Enable on ESP01/ESP02 for A/B attribution.
+
+config FACTORY_CPU0_LATENCY_PERIOD_US
+    int "CPU0 latency sample period (microseconds)"
+    range 100 10000
+    default 250
+    depends on FACTORY_CPU0_LATENCY_MONITOR
+
+config FACTORY_CPU0_LATENCY_THRESHOLD_US
+    int "CPU0 latency event threshold (microseconds)"
+    range 1 10000
+    default 50
+    depends on FACTORY_CPU0_LATENCY_MONITOR
+
+config FACTORY_CPU0_LATENCY_BOUNDARY_GUARD_US
+    int "Suppress latency-probe pulses within this COMMIT guard (microseconds)"
+    range 0 5000
+    default 400
+    depends on FACTORY_CPU0_LATENCY_MONITOR
+    help
+        The display scheduler publishes each exact local COMMIT target to the
+        monitor. Samples inside +/- this guard are still measured and retained
+        so CPU0-mask coverage remains complete, but their GPIO32 probe pulse is
+        suppressed. This keeps Analyzer marker edges away from GPIO33 without
+        hiding a latency event that delays COMMIT.
+
+config FACTORY_CPU0_LATENCY_PROBE_GPIO
+    int "CPU0 latency-event probe GPIO"
+    range 0 33
+    default 32
+    depends on FACTORY_CPU0_LATENCY_MONITOR
+    help
+        Pulsed for a few microseconds only when the monitor records a >threshold
+        latency event. In the two-board analyzer build use GPIO32 on each timer,
+        replacing the old START-edge diagnostic.
+
+config FACTORY_CPU0_LATENCY_CANARY_HOLD_US
+    int "CPU0 latency-monitor canary critical-section duration"
+    range 300 5000
+    default 600
+    depends on FACTORY_CPU0_LATENCY_MONITOR
+    help
+        Once per countdown, at +15.5 s (well between COMMIT boundaries), a
+        diagnostic task pinned to CPU0 holds a private critical section for this
+        duration. With the 250 us sampler this guarantees a detected event and
+        validates task attribution. Diagnostic builds only.
+
+config FACTORY_CPU0_LATENCY_ISR_CANARY_HOLD_US
+    int "CPU0 same-level ISR canary duration"
+    range 300 5000
+    default 500
+    depends on FACTORY_CPU0_LATENCY_MONITOR
+    help
+        Once per countdown, about +16.5 s after RUN begins, an ISR-dispatch
+        esp_timer callback at the same configured interrupt level as COMMIT
+        busy-waits for this duration. The 4 kHz GPTimer monitor must retain the
+        resulting delay, validating the same-level-ISR blocker signature.
+        Diagnostic builds only.
+
+config FACTORY_ANALYZER_PRESENTATION_OFFSET_US
+    int "Diagnostic presentation offset for Analyzer separation (microseconds)"
+    range 0 1000
+    default 0
+    depends on IDF_TARGET_ESP32
+    help
+        Adds a diagnostic-only offset to GPIO33 presentation deadlines while
+        leaving TimerTask/master START time unchanged. Set ESP02 to +50 us in
+        Analyzer runs so the two COMMIT edges do not enter the analyzer's roughly
+        5-10 us close-edge distortion zone.
+
 config FACTORY_POST_RUN_TIMING_DUMP
     bool "Enable paced asynchronous post-run timing dump"
     default n

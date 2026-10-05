@@ -6,7 +6,7 @@
 
 namespace factory_timer {
 
-constexpr std::size_t kMaxPacketLength = 191;
+constexpr std::size_t kMaxPacketLength = 511;
 constexpr uint32_t kMinDurationSeconds = 1;
 constexpr uint32_t kMaxDurationSeconds = 86400;
 constexpr uint32_t kMinStartDelayMs = 100;
@@ -83,7 +83,17 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
                  int rssi_dbm, uint8_t wifi_channel, std::string_view bssid,
                  std::string_view rtc_discipline_state, uint16_t rtc_fit_points,
                  double rtc_fit_rms_us, uint32_t rtc_queue_drops,
-                 bool rtc_temperature_valid);
+                 bool rtc_temperature_valid, double rtc_rate_ppm_vs_rtc,
+                 uint64_t rtc_fit_outliers, double rtc_temperature_c,
+                 int rtc_sqw_core, uint8_t health_flags,
+                 int64_t sync_source_offset_us, int64_t sync_epoch_local_us,
+                 int64_t sync_epoch_disciplined_us,
+                 int64_t sync_master_minus_disciplined_us,
+                 int64_t start_error_us, int64_t scheduler_lateness_us,
+                 int64_t start_publish_lateness_us,
+                 int64_t worst_publish_lateness_us,
+                 uint32_t frame_not_ready_count, uint64_t rtc_accepted_edges,
+                 uint64_t rtc_inferred_missing_edges, uint64_t rtc_holdover_entries);
 int FormatSyncReply(char* destination, std::size_t capacity, std::string_view device_id,
                     uint64_t sync_id, int64_t master_t1_us,
                     int64_t local_t2_us, int64_t local_t3_us,

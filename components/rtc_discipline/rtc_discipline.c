@@ -205,6 +205,10 @@ static void set_state(rtc_discipline_state_t new_state)
 
     taskENTER_CRITICAL(&s_ctx.mux);
     old_state = s_ctx.status.state;
+    if (old_state != RTC_DISCIPLINE_HOLDOVER &&
+        new_state == RTC_DISCIPLINE_HOLDOVER) {
+        s_ctx.status.holdover_entries++;
+    }
     s_ctx.status.state = new_state;
     taskEXIT_CRITICAL(&s_ctx.mux);
 

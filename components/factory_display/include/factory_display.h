@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -29,6 +30,19 @@ void factory_display_note_started(uint64_t command_id,
 
 // Cancels any pending/running visual countdown and returns to the idle frame.
 void factory_display_reset(void);
+
+// Compact per-run presentation health snapshot for controller-visible STATUS
+// telemetry. Values belong to command_id when valid is true.
+typedef struct {
+    bool valid;
+    uint64_t command_id;
+    int64_t start_publish_lateness_us;
+    int64_t worst_publish_lateness_us;
+    uint32_t frame_not_ready_count;
+} factory_display_health_t;
+
+// Thread-safe snapshot of the most recent armed/running display schedule.
+void factory_display_get_health(factory_display_health_t* out_health);
 
 #ifdef __cplusplus
 }

@@ -1,8 +1,1 @@
-Factory Timer ESP32 firmware
-Firmware variant: v6.23.10 CPU0 blocker attribution / historical-workload Stage B
-Baseline: v6.23.9 CPU0 latency monitor + GCC15 IRAM declaration fix
-Stage B workload: RUNNING heartbeats suppressed, matching the three historical ESP02 stall runs
-Monitor: CPU0 GPTimer 250 us, interrupt level exactly CONFIG_ESP_TIMER_INTERRUPT_LEVEL, threshold 50 us
-Positive controls: 600 us task critical-section canary at +15.5 s and 500 us same-level ISR canary at +16.5 s
-Boundary handling: samples remain active near COMMIT; only GPIO32 probe pulses are suppressed in +/-400 us guard
-Analyzer presentation offset: 0 us on ESP01 and ESP02 (no deliberate production timing skew)
+v6.23.15a — mid-second canary compile fix

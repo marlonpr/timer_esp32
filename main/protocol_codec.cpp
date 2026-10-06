@@ -373,7 +373,20 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
                  int64_t start_publish_lateness_us,
                  int64_t worst_publish_lateness_us,
                  uint32_t frame_not_ready_count, uint64_t rtc_accepted_edges,
-                 uint64_t rtc_inferred_missing_edges, uint64_t rtc_holdover_entries) {
+                 uint64_t rtc_inferred_missing_edges, uint64_t rtc_holdover_entries,
+                 bool cpu0_monitor_valid,
+                 uint32_t cpu0_monitor_samples,
+                 uint32_t cpu0_monitor_event_count,
+                 uint32_t cpu0_monitor_worst_us,
+                 std::string_view cpu0_monitor_worst_task,
+                 uint32_t cpu0_commit_late_count,
+                 uint32_t cpu0_commit_worst_us,
+                 bool cpu0_commit_overlap,
+                 uint32_t cpu0_wrong_core_callbacks,
+                 uint32_t cpu0_monitor_overflow,
+                 bool cpu0_interrupt_level_match,
+                 uint32_t cpu0_monitor_missed_periods,
+                 std::string_view firmware_elf_sha8) {
     if (destination == nullptr || capacity == 0 || !ValidDeviceId(device_id) ||
         bssid.size() != 17 || rtc_discipline_state.empty() ||
         rtc_discipline_state.size() > 16 || !std::isfinite(rtc_fit_rms_us) ||
@@ -382,9 +395,13 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
         rtc_rate_ppm_vs_rtc < -1000000.0 || rtc_rate_ppm_vs_rtc > 1000000.0 ||
         !std::isfinite(rtc_temperature_c) ||
         rtc_temperature_c < -1000.0 || rtc_temperature_c > 1000.0 ||
-        health_flags > 7u) return -1;
+        health_flags > 7u || cpu0_monitor_worst_task.empty() ||
+        cpu0_monitor_worst_task.size() > 15 || firmware_elf_sha8.size() != 8) return -1;
+    for (char c : firmware_elf_sha8) {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return -1;
+    }
     return std::snprintf(destination, capacity,
-                         "FCT2|STATUS|%.*s|%016llX|%s|%u|%d|%u|%.*s|%.*s|%u|%.3f|%u|%u|%.6f|%llu|%.2f|%d|%u|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%u|%llu|%llu|%llu",
+                         "FCT2|STATUS|%.*s|%016llX|%s|%u|%d|%u|%.*s|%.*s|%u|%.3f|%u|%u|%.6f|%llX|%.2f|%d|%u|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%u|%llX|%llX|%llX|%u|%X|%X|%X|%.*s|%X|%X|%u|%X|%X|%u|%X|%.*s",
                          static_cast<int>(device_id.size()), device_id.data(),
                          static_cast<unsigned long long>(command_id), TimerStateName(state),
                          static_cast<unsigned>(remaining_seconds), rssi_dbm,
@@ -407,7 +424,22 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
                          static_cast<unsigned>(frame_not_ready_count),
                          static_cast<unsigned long long>(rtc_accepted_edges),
                          static_cast<unsigned long long>(rtc_inferred_missing_edges),
-                         static_cast<unsigned long long>(rtc_holdover_entries));
+                         static_cast<unsigned long long>(rtc_holdover_entries),
+                         cpu0_monitor_valid ? 1u : 0u,
+                         static_cast<unsigned>(cpu0_monitor_samples),
+                         static_cast<unsigned>(cpu0_monitor_event_count),
+                         static_cast<unsigned>(cpu0_monitor_worst_us),
+                         static_cast<int>(cpu0_monitor_worst_task.size()),
+                         cpu0_monitor_worst_task.data(),
+                         static_cast<unsigned>(cpu0_commit_late_count),
+                         static_cast<unsigned>(cpu0_commit_worst_us),
+                         cpu0_commit_overlap ? 1u : 0u,
+                         static_cast<unsigned>(cpu0_wrong_core_callbacks),
+                         static_cast<unsigned>(cpu0_monitor_overflow),
+                         cpu0_interrupt_level_match ? 1u : 0u,
+                         static_cast<unsigned>(cpu0_monitor_missed_periods),
+                         static_cast<int>(firmware_elf_sha8.size()),
+                         firmware_elf_sha8.data());
 }
 
 int FormatSyncReply(char* destination, std::size_t capacity, std::string_view device_id,

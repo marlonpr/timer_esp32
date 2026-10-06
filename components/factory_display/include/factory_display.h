@@ -39,6 +39,26 @@ typedef struct {
     int64_t start_publish_lateness_us;
     int64_t worst_publish_lateness_us;
     uint32_t frame_not_ready_count;
+
+    // v6.23.11 fleet CPU0 latency-monitor summary. These fields are valid
+    // when cpu0_monitor_valid is true and belong to the same command_id.
+    bool cpu0_monitor_valid;
+    uint32_t cpu0_monitor_samples;
+    uint32_t cpu0_monitor_missed_periods;
+    uint32_t cpu0_monitor_event_count;
+    uint32_t cpu0_monitor_worst_us;
+    char cpu0_monitor_worst_task[16];
+    uint32_t cpu0_commit_late_count;
+    uint32_t cpu0_commit_worst_us;
+    bool cpu0_commit_overlap;
+    uint32_t cpu0_overlap_sample_us;
+    uint32_t cpu0_overlap_commit_us;
+    char cpu0_overlap_task[16];
+    uint32_t cpu0_wrong_core_callbacks;
+    uint32_t cpu0_monitor_overflow;
+    uint32_t cpu0_commit_overflow;
+    uint8_t cpu0_sampler_intr_level;
+    uint8_t cpu0_commit_intr_level;
 } factory_display_health_t;
 
 // Thread-safe snapshot of the most recent armed/running display schedule.

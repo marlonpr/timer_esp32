@@ -405,7 +405,7 @@ bool ArmBoundaryPublish(uint32_t boundary,
                         int64_t* arm_us_out) {
     if (s_boundary_publish_timer == nullptr) return false;
     target_local_us = PresentationTargetLocalUs(target_local_us);
-    cpu0_latency_monitor_set_commit_target(target_local_us);
+    cpu0_latency_monitor_set_commit_target(boundary, target_local_us);
     if (esp_timer_is_active(s_boundary_publish_timer)) {
         (void)esp_timer_stop(s_boundary_publish_timer);
     }
@@ -1759,7 +1759,37 @@ extern "C" void factory_display_reset(void) {
 
 extern "C" void factory_display_get_health(factory_display_health_t* out_health) {
     if (out_health == nullptr) return;
+    factory_display_health_t snapshot{};
     portENTER_CRITICAL(&s_health_mux);
-    *out_health = s_health_summary;
+    snapshot = s_health_summary;
     portEXIT_CRITICAL(&s_health_mux);
+
+#if CONFIG_IDF_TARGET_ESP32
+    cpu0_latency_monitor_summary_t monitor{};
+    cpu0_latency_monitor_get_summary(&monitor);
+    if (monitor.valid && monitor.command_id == snapshot.command_id) {
+        snapshot.cpu0_monitor_valid = true;
+        snapshot.cpu0_monitor_samples = monitor.sample_callbacks;
+        snapshot.cpu0_monitor_missed_periods = monitor.missed_periods;
+        snapshot.cpu0_monitor_event_count = monitor.event_count;
+        snapshot.cpu0_monitor_worst_us = monitor.worst_lateness_us;
+        std::snprintf(snapshot.cpu0_monitor_worst_task,
+                      sizeof(snapshot.cpu0_monitor_worst_task),
+                      "%s", monitor.worst_task);
+        snapshot.cpu0_commit_late_count = monitor.commit_late_count;
+        snapshot.cpu0_commit_worst_us = monitor.worst_commit_lateness_us;
+        snapshot.cpu0_commit_overlap = monitor.commit_overlap;
+        snapshot.cpu0_overlap_sample_us = monitor.overlap_sample_lateness_us;
+        snapshot.cpu0_overlap_commit_us = monitor.overlap_commit_lateness_us;
+        std::snprintf(snapshot.cpu0_overlap_task,
+                      sizeof(snapshot.cpu0_overlap_task),
+                      "%s", monitor.overlap_task);
+        snapshot.cpu0_wrong_core_callbacks = monitor.wrong_core_callbacks;
+        snapshot.cpu0_monitor_overflow = monitor.event_overflow;
+        snapshot.cpu0_commit_overflow = monitor.commit_overflow;
+        snapshot.cpu0_sampler_intr_level = monitor.sampler_intr_level;
+        snapshot.cpu0_commit_intr_level = monitor.commit_intr_level;
+    }
+#endif
+    *out_health = snapshot;
 }

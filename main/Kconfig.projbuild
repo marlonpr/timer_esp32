@@ -187,15 +187,17 @@ config FACTORY_TIMING_MECHANISM_TEST
 
 
 config FACTORY_CPU0_LATENCY_MONITOR
-    bool "Enable CPU0 GPTimer interrupt-latency monitor"
-    default n
+    bool "Enable fleet CPU0 GPTimer interrupt-latency monitor"
+    default y if IDF_TARGET_ESP32
     depends on IDF_TARGET_ESP32
     help
-        Diagnostic-only v6.23.9 monitor. A level-1 GPTimer alarm runs on CPU0
-        at 4 kHz and retains only lateness excursions above the configured
-        threshold. The monitor stores the interrupted task handle, suppresses
-        sampling alarms around exact COMMIT deadlines, and dumps buffered events
-        only after the countdown. Enable on ESP01/ESP02 for A/B attribution.
+        v6.23.15 fleet monitor. A free-running GPTimer alarm runs on CPU0 at 4 kHz at
+        the same configured interrupt level as the ISR-dispatch esp_timer
+        COMMIT callback. It measures ISR-entry lateness from hardware count_value - alarm_value,
+        counts skipped 250 us periods, retains excursions above the configured
+        threshold, and exposes compact per-run summary fields through STATUS.
+        Optional task/ISR canaries are separately gated and default off; the
+        fleet profiles generate no canary or GPIO diagnostic pulse.
 
 config FACTORY_CPU0_LATENCY_PERIOD_US
     int "CPU0 latency sample period (microseconds)"
@@ -209,50 +211,70 @@ config FACTORY_CPU0_LATENCY_THRESHOLD_US
     default 50
     depends on FACTORY_CPU0_LATENCY_MONITOR
 
-config FACTORY_CPU0_LATENCY_BOUNDARY_GUARD_US
-    int "Suppress latency-probe pulses within this COMMIT guard (microseconds)"
-    range 0 5000
-    default 400
+config FACTORY_CPU0_LATENCY_TASK_CANARY
+    bool "Enable task-held critical-section telemetry canary"
+    default n
     depends on FACTORY_CPU0_LATENCY_MONITOR
     help
-        The display scheduler publishes each exact local COMMIT target to the
-        monitor. Samples inside +/- this guard are still measured and retained
-        so CPU0-mask coverage remains complete, but their GPIO32 probe pulse is
-        suppressed. This keeps Analyzer marker edges away from GPIO33 without
-        hiding a latency event that delays COMMIT.
+        Validation only. A CPU0 task named lat_canary enters a private critical
+        section across one configured display COMMIT boundary. This proves the
+        complete path from the 4 kHz monitor through STATUS encoding and the
+        Windows health CSV. Leave disabled in fleet/production builds.
 
-config FACTORY_CPU0_LATENCY_PROBE_GPIO
-    int "CPU0 latency-event probe GPIO"
-    range 0 33
-    default 32
-    depends on FACTORY_CPU0_LATENCY_MONITOR
+config FACTORY_CPU0_LATENCY_TASK_CANARY_MIDSECOND
+    bool "Schedule task canary from RUN begin instead of across COMMIT"
+    default n
+    depends on FACTORY_CPU0_LATENCY_TASK_CANARY
     help
-        Pulsed for a few microseconds only when the monitor records a >threshold
-        latency event. In the two-board analyzer build use GPIO32 on each timer,
-        replacing the old START-edge diagnostic.
+        Validation only. When enabled, schedule the task critical section at a
+        fixed local-time offset after RUN begins. This is used to validate the
+        GPTimer lateness arithmetic without intentionally delaying COMMIT.
+
+config FACTORY_CPU0_LATENCY_TASK_CANARY_AFTER_RUN_US
+    int "Task canary offset after RUN begin (microseconds)"
+    range 1000000 600000000
+    default 10500000
+    depends on FACTORY_CPU0_LATENCY_TASK_CANARY_MIDSECOND
+
+config FACTORY_CPU0_LATENCY_CANARY_BOUNDARY
+    int "Task canary COMMIT boundary"
+    range 2 600
+    default 10
+    depends on FACTORY_CPU0_LATENCY_TASK_CANARY && !FACTORY_CPU0_LATENCY_TASK_CANARY_MIDSECOND
+
+config FACTORY_CPU0_LATENCY_CANARY_LEAD_US
+    int "Task canary start lead before COMMIT (microseconds)"
+    range 50 2000
+    default 150
+    depends on FACTORY_CPU0_LATENCY_TASK_CANARY && !FACTORY_CPU0_LATENCY_TASK_CANARY_MIDSECOND
 
 config FACTORY_CPU0_LATENCY_CANARY_HOLD_US
-    int "CPU0 latency-monitor canary critical-section duration"
+    int "Task canary critical-section duration (microseconds)"
     range 300 5000
     default 600
+    depends on FACTORY_CPU0_LATENCY_TASK_CANARY
+
+config FACTORY_CPU0_LATENCY_ISR_CANARY
+    bool "Enable same-level ISR canary"
+    default n
     depends on FACTORY_CPU0_LATENCY_MONITOR
     help
-        Once per countdown, at +15.5 s (well between COMMIT boundaries), a
-        diagnostic task pinned to CPU0 holds a private critical section for this
-        duration. With the 250 us sampler this guarantees a detected event and
-        validates task attribution. Diagnostic builds only.
+        Diagnostic-only mechanism control retained from v6.23.10. An ISR-dispatch
+        esp_timer callback busy-waits once during RUNNING so the monitor's
+        same-level ISR signature can be revalidated when needed. Fleet profiles
+        leave this disabled.
+
+config FACTORY_CPU0_LATENCY_ISR_CANARY_AFTER_RUN_US
+    int "Same-level ISR canary offset after RUN begin (microseconds)"
+    range 1000000 600000000
+    default 16500000
+    depends on FACTORY_CPU0_LATENCY_ISR_CANARY
 
 config FACTORY_CPU0_LATENCY_ISR_CANARY_HOLD_US
-    int "CPU0 same-level ISR canary duration"
+    int "Same-level ISR canary duration (microseconds)"
     range 300 5000
     default 500
-    depends on FACTORY_CPU0_LATENCY_MONITOR
-    help
-        Once per countdown, about +16.5 s after RUN begins, an ISR-dispatch
-        esp_timer callback at the same configured interrupt level as COMMIT
-        busy-waits for this duration. The 4 kHz GPTimer monitor must retain the
-        resulting delay, validating the same-level-ISR blocker signature.
-        Diagnostic builds only.
+    depends on FACTORY_CPU0_LATENCY_ISR_CANARY
 
 config FACTORY_ANALYZER_PRESENTATION_OFFSET_US
     int "Diagnostic presentation offset for Analyzer separation (microseconds)"

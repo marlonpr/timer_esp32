@@ -18,6 +18,7 @@
 #if CONFIG_IDF_TARGET_ESP32S3
 #include "driver/temperature_sensor.h"
 #endif
+#include "esp_app_desc.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -106,6 +107,19 @@ constexpr size_t kStatusPathTraceCapacity = 64;
 constexpr size_t kStatusTxTraceCapacity = 128;
 constexpr size_t kSyncReplyTraceCapacity = 64;
 constexpr size_t kEarlyIngressCapacity = 128;
+
+std::string_view FirmwareElfSha8() {
+    static char sha8[9]{};
+    static bool initialized = false;
+    if (!initialized) {
+        (void)esp_app_get_elf_sha256(sha8, sizeof(sha8));
+        if (std::strlen(sha8) != 8) {
+            std::snprintf(sha8, sizeof(sha8), "00000000");
+        }
+        initialized = true;
+    }
+    return std::string_view(sha8, 8);
+}
 
 EventGroupHandle_t wifi_event_group;
 esp_netif_t *wifi_sta_netif = nullptr;
@@ -607,6 +621,11 @@ void InitialiseWifi() {
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     wifi_sta_netif = esp_netif_create_default_wifi_sta();
     ESP_ERROR_CHECK(wifi_sta_netif == nullptr ? ESP_FAIL : ESP_OK);
+    // Keep DHCP addressing, but derive the station hostname from the unique
+    // factory device ID so identity-only fleet profiles cannot clone ESP01's
+    // network hostname.
+    ESP_ERROR_CHECK(esp_netif_set_hostname(wifi_sta_netif, CONFIG_FACTORY_DEVICE_ID));
+    ESP_LOGI(kTag, "DHCP station hostname: %s", CONFIG_FACTORY_DEVICE_ID);
 
     if (xTaskCreate(&DhcpRetryTask, "dhcp_retry", 3072, nullptr, 4,
                     &dhcp_retry_task_handle) != pdPASS) {
@@ -706,7 +725,7 @@ WifiDiagnostics ReadWifiDiagnostics() {
     return diagnostics;
 }
 
-constexpr uint16_t kRtcStartMinimumFitPoints = 64;
+constexpr uint16_t kRtcStartMinimumFitPoints = 129;
 constexpr double kRtcStartMaximumFitRmsUs = 3.0;
 
 struct RtcStatusFields {
@@ -822,6 +841,16 @@ void SendStatus(int socket_fd, const sockaddr_in &peer,
         frame_not_ready_count = display_health.frame_not_ready_count;
     }
 
+    const uint64_t cpu0_overflow_total64 =
+        static_cast<uint64_t>(display_health.cpu0_monitor_overflow) +
+        static_cast<uint64_t>(display_health.cpu0_commit_overflow);
+    const uint32_t cpu0_overflow_total = cpu0_overflow_total64 > UINT32_MAX
+        ? UINT32_MAX
+        : static_cast<uint32_t>(cpu0_overflow_total64);
+    const bool cpu0_interrupt_level_match =
+        display_health.cpu0_sampler_intr_level != 0 &&
+        display_health.cpu0_sampler_intr_level == display_health.cpu0_commit_intr_level;
+
     char packet[factory_timer::kMaxPacketLength + 1]{};
     const int length = factory_timer::FormatStatus(
         packet, sizeof(packet), CONFIG_FACTORY_DEVICE_ID,
@@ -834,7 +863,22 @@ void SendStatus(int socket_fd, const sockaddr_in &peer,
         sync_master_minus_disciplined_us, start_error_us, scheduler_lateness_us,
         start_publish_lateness_us, worst_publish_lateness_us,
         frame_not_ready_count, rtc.accepted_edges, rtc.inferred_missing_edges,
-        rtc.holdover_entries);
+        rtc.holdover_entries,
+        display_health.cpu0_monitor_valid,
+        display_health.cpu0_monitor_samples,
+        display_health.cpu0_monitor_event_count,
+        display_health.cpu0_monitor_worst_us,
+        display_health.cpu0_monitor_worst_task[0] != '\0'
+            ? std::string_view(display_health.cpu0_monitor_worst_task)
+            : std::string_view("NONE"),
+        display_health.cpu0_commit_late_count,
+        display_health.cpu0_commit_worst_us,
+        display_health.cpu0_commit_overlap,
+        display_health.cpu0_wrong_core_callbacks,
+        cpu0_overflow_total,
+        cpu0_interrupt_level_match,
+        display_health.cpu0_monitor_missed_periods,
+        FirmwareElfSha8());
     if (timing != nullptr) timing->format_done_us = esp_timer_get_time();
     SendPacket(socket_fd, peer, packet, length, "STATUS",
                timing != nullptr ? &timing->sendto_entry_us : nullptr,

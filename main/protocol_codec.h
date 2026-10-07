@@ -107,6 +107,29 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
                  bool cpu0_interrupt_level_match = false,
                  uint32_t cpu0_monitor_missed_periods = 0,
                  std::string_view firmware_elf_sha8 = "00000000");
+struct RunDiagnosticFields {
+    bool valid{};
+    uint32_t period_us{};
+    uint32_t threshold_us{};
+    int64_t monitor_start_us{};
+    int64_t tstar_local_us{};
+    int64_t monitor_end_us{};
+    uint32_t first_alarm_offset_us{};
+    uint64_t expected_periods{};
+    uint32_t sample_callbacks{};
+    uint32_t missed_periods{};
+    uint32_t cpu0_events_ge_50us{};
+    uint32_t rtc_discipline_events_ge_50us{};
+    uint32_t wifi_events_ge_50us{};
+    uint32_t udp_events_ge_50us{};
+    uint32_t commit_late_events{};
+    uint32_t commit_ge_300us{};
+    uint32_t rearm_failures{};
+};
+int FormatRunDiagnostic(char* destination, std::size_t capacity,
+                        std::string_view device_id, uint64_t command_id,
+                        const RunDiagnosticFields& fields);
+
 int FormatSyncReply(char* destination, std::size_t capacity, std::string_view device_id,
                     uint64_t sync_id, int64_t master_t1_us,
                     int64_t local_t2_us, int64_t local_t3_us,

@@ -1,1 +1,2 @@
-v6.23.15a — mid-second canary compile fix
+v6.23.18 — boot-cached display/monitor task inventories; optional 500 us late-START epoch regression
+(folder name kept as firmware_v6_23_16 so bundle paths stay stable)

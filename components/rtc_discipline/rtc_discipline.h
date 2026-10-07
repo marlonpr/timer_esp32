@@ -60,6 +60,7 @@ typedef struct {
     uint16_t fit_point_count;
     float rtc_temperature_c;
     bool rtc_temperature_valid;
+    int64_t rtc_temperature_sample_local_us;
     bool osf_was_set;
     bool osf_cleared_after_edges;
 
@@ -94,6 +95,13 @@ int64_t rtc_discipline_disciplined_to_local_us(int64_t disciplined_us);
 
 /** Stable text name for logs and qualification tooling. */
 const char *rtc_discipline_state_name(rtc_discipline_state_t state);
+
+/** Drain any already-started read, then suppress periodic reads until finish/reset. */
+void rtc_discipline_begin_run(uint64_t command_id);
+/** Fresh immediate I2C read; idempotent after success. False keeps FINISHED status gated. */
+bool rtc_discipline_finish_run_temperature(uint64_t command_id, int64_t finished_local_us);
+/** Resume periodic reads on RESET without publishing a post-run snapshot. */
+void rtc_discipline_cancel_run(void);
 
 /** Snapshot estimator/health state. */
 void rtc_discipline_get_status(rtc_discipline_status_t *out_status);

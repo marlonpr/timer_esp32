@@ -388,6 +388,8 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
                  uint32_t cpu0_monitor_missed_periods,
                  std::string_view firmware_elf_sha8) {
     if (destination == nullptr || capacity == 0 || !ValidDeviceId(device_id) ||
+        remaining_seconds > kMaxDurationSeconds || rssi_dbm < -127 || rssi_dbm > 0 ||
+        rtc_sqw_core < -1 || rtc_sqw_core > 1 ||
         bssid.size() != 17 || rtc_discipline_state.empty() ||
         rtc_discipline_state.size() > 16 || !std::isfinite(rtc_fit_rms_us) ||
         rtc_fit_rms_us < 0.0 || rtc_fit_rms_us > 1000000.0 ||
@@ -397,6 +399,9 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
         rtc_temperature_c < -1000.0 || rtc_temperature_c > 1000.0 ||
         health_flags > 7u || cpu0_monitor_worst_task.empty() ||
         cpu0_monitor_worst_task.size() > 15 || firmware_elf_sha8.size() != 8) return -1;
+    if (rtc_discipline_state != "DISABLED" && rtc_discipline_state != "UNINITIALIZED" &&
+        rtc_discipline_state != "ACQUIRING" && rtc_discipline_state != "LOCKED" &&
+        rtc_discipline_state != "HOLDOVER") return -1;
     for (char c : firmware_elf_sha8) {
         if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return -1;
     }
@@ -440,6 +445,25 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
                          static_cast<unsigned>(cpu0_monitor_missed_periods),
                          static_cast<int>(firmware_elf_sha8.size()),
                          firmware_elf_sha8.data());
+}
+
+int FormatRunDiagnostic(char* destination, std::size_t capacity,
+                        std::string_view device_id, uint64_t command_id,
+                        const RunDiagnosticFields& f) {
+    if (destination == nullptr || capacity == 0 || !ValidDeviceId(device_id)) return -1;
+    return std::snprintf(destination, capacity,
+        "FCT2|RUN_DIAG|%.*s|%016llX|%u|%u|%u|%lld|%lld|%lld|%u|%llX|%X|%X|%X|%X|%X|%X|%X|%X|%X",
+        static_cast<int>(device_id.size()), device_id.data(),
+        static_cast<unsigned long long>(command_id), f.valid ? 1U : 0U,
+        static_cast<unsigned>(f.period_us), static_cast<unsigned>(f.threshold_us),
+        static_cast<long long>(f.monitor_start_us), static_cast<long long>(f.tstar_local_us),
+        static_cast<long long>(f.monitor_end_us), static_cast<unsigned>(f.first_alarm_offset_us),
+        static_cast<unsigned long long>(f.expected_periods),
+        static_cast<unsigned>(f.sample_callbacks), static_cast<unsigned>(f.missed_periods),
+        static_cast<unsigned>(f.cpu0_events_ge_50us), static_cast<unsigned>(f.rtc_discipline_events_ge_50us),
+        static_cast<unsigned>(f.wifi_events_ge_50us), static_cast<unsigned>(f.udp_events_ge_50us),
+        static_cast<unsigned>(f.commit_late_events), static_cast<unsigned>(f.commit_ge_300us),
+        static_cast<unsigned>(f.rearm_failures));
 }
 
 int FormatSyncReply(char* destination, std::size_t capacity, std::string_view device_id,

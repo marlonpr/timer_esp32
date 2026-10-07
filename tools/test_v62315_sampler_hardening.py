@@ -43,7 +43,7 @@ checks={
 
 # Arithmetic regression: a 605 us blocker with first sample 34 us after mask
 # must retain 571 us or more depending service overhead, not one period less.
-period=250
+period=251
 hold=605
 first_due_after_begin=34
 service_after_end=6
@@ -51,9 +51,9 @@ late=(hold-first_due_after_begin)+service_after_end
 missed=late//period
 checks['605us arithmetic synthetic lateness 577']=late==577
 checks['605us arithmetic synthetic missed2']=missed==2
-# Any exact 1000 us block must leave the first pending deadline >=750 us late.
+# Any exact 1000 us block must leave the first pending deadline >=749 us late.
 min_late=min(1000-d for d in range(1,period+1))
-checks['1000us grid guarantee >=750']=min_late==750
+checks['1000us grid guarantee >=749']=min_late==749
 
 for k,v in checks.items(): print(f'{k}: {"PASS" if v else "FAIL"}')
 

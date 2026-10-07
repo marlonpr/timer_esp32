@@ -22,6 +22,14 @@ constexpr char kTag[] = "cpu0_latency";
 
 #if defined(CONFIG_FACTORY_CPU0_LATENCY_MONITOR) && CONFIG_FACTORY_CPU0_LATENCY_MONITOR
 constexpr uint32_t kPeriodUs = CONFIG_FACTORY_CPU0_LATENCY_PERIOD_US;
+// v6.23.17 re-arm guard. The ISR never programs a deadline closer than
+// kRearmMinLeadUs to the current count, so correctness does not depend on how
+// a given target treats an alarm written in the past. The extra raw-count read
+// happens only when the computed deadline is within kRearmCheckWindowUs of the
+// ISR-entry count, i.e. after a blocker that ended just before a grid point.
+constexpr uint64_t kRearmCheckWindowUs = 32;
+constexpr uint64_t kRearmMinLeadUs = 8;
+static_assert(kRearmMinLeadUs < kRearmCheckWindowUs, "Re-arm guard window must exceed its lead");
 constexpr uint32_t kThresholdUs = CONFIG_FACTORY_CPU0_LATENCY_THRESHOLD_US;
 constexpr size_t kEventCapacity = 64;
 constexpr size_t kCommitEventCapacity = 32;
@@ -127,11 +135,23 @@ DRAM_ATTR volatile uint64_t s_run_command_id = 0;
 DRAM_ATTR volatile int64_t s_commit_target_local_us = 0;
 DRAM_ATTR volatile uint32_t s_commit_target_boundary = 0;
 DRAM_ATTR volatile int64_t s_run_begin_local_us = 0;
+DRAM_ATTR volatile int64_t s_run_end_local_us = 0;
+DRAM_ATTR volatile int64_t s_tstar_local_us = 0;
+DRAM_ATTR volatile uint64_t s_run_begin_count = 0;
+DRAM_ATTR volatile uint64_t s_run_end_count = 0;
+DRAM_ATTR TaskHandle_t s_rtc_task = nullptr;
+DRAM_ATTR TaskHandle_t s_wifi_task = nullptr;
+DRAM_ATTR TaskHandle_t s_udp_task = nullptr;
+DRAM_ATTR volatile uint32_t s_rtc_events = 0;
+DRAM_ATTR volatile uint32_t s_wifi_events = 0;
+DRAM_ATTR volatile uint32_t s_udp_events = 0;
+DRAM_ATTR volatile uint32_t s_commit_ge300 = 0;
 DRAM_ATTR volatile int64_t s_timer_to_local_offset_us = 0;
 DRAM_ATTR volatile bool s_timer_local_mapping_valid = false;
 DRAM_ATTR volatile uint32_t s_sample_callbacks = 0;
 DRAM_ATTR volatile uint32_t s_missed_periods = 0;
 DRAM_ATTR volatile uint32_t s_rearm_failures = 0;
+DRAM_ATTR volatile uint32_t s_rearm_guard_skips = 0;
 DRAM_ATTR volatile uint32_t s_wrong_core_callbacks = 0;
 
 DRAM_ATTR volatile uint32_t s_event_sequence = 0;
@@ -172,6 +192,7 @@ DRAM_ATTR IsrCanaryRecord s_isr_canary{};
 
 TaskIdentity s_task_inventory[kTaskInventoryCapacity]{};
 size_t s_task_inventory_count = 0;
+bool s_task_inventory_cached = false;
 cpu0_latency_monitor_summary_t s_summary{};
 portMUX_TYPE s_summary_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -188,6 +209,9 @@ void CopyTaskName(char* destination, std::size_t capacity, const char* source) {
 }
 
 void RefreshTaskInventory() {
+    s_rtc_task = nullptr;
+    s_wifi_task = nullptr;
+    s_udp_task = nullptr;
 #if defined(CONFIG_FREERTOS_USE_TRACE_FACILITY) && CONFIG_FREERTOS_USE_TRACE_FACILITY
     TaskStatus_t status[kTaskInventoryCapacity]{};
     configRUN_TIME_COUNTER_TYPE total_runtime = 0;
@@ -201,6 +225,9 @@ void RefreshTaskInventory() {
         out.core_id = xTaskGetCoreID(status[i].xHandle);
         out.priority = status[i].uxCurrentPriority;
         std::snprintf(out.name, sizeof(out.name), "%s", status[i].pcTaskName);
+        if (std::strcmp(out.name, "rtc_discipline") == 0) s_rtc_task = out.handle;
+        if (std::strcmp(out.name, "wifi") == 0) s_wifi_task = out.handle;
+        if (std::strcmp(out.name, "udp_command") == 0) s_udp_task = out.handle;
     }
 #else
     s_task_inventory_count = 0;
@@ -217,7 +244,7 @@ const TaskIdentity* FindTaskIdentity(TaskHandle_t handle) {
 bool IRAM_ATTR EventCouldOverlapCommit(const LatencyEvent& event, int64_t commit_target_local_us) {
     // The retained event proves that the sampler deadline at expected_local_us
     // could not execute until actual_local_us. The continuous blocker can have
-    // started any time after the previous 250 us sampler deadline, so use one
+    // started any time after the previous sampler deadline, so use one
     // sample period of backward uncertainty. This is intentionally called a
     // plausible overlap, not proof of exact blocker start time.
     const int64_t earliest_possible_block_us =
@@ -256,13 +283,31 @@ bool IRAM_ATTR OnAlarm(gptimer_handle_t timer,
         : 0ULL;
     const uint64_t skipped_periods64 =
         late_ticks / static_cast<uint64_t>(kPeriodUs);
-    const uint64_t next_alarm_count = alarm_value +
+    uint64_t next_alarm_count = alarm_value +
         (skipped_periods64 + 1ULL) * static_cast<uint64_t>(kPeriodUs);
 
+    // v6.23.17: next_alarm_count is always after count_value, but ISR work
+    // between the driver's count capture and the write below can consume a
+    // small remaining margin. Rather than rely on chip-specific behaviour for
+    // a deadline already in the past (an equality-only comparator would stop
+    // the sampler for the rest of the run), skip such deadlines explicitly and
+    // charge them as missed periods below.
+    uint32_t guard_skips = 0U;
+    if (next_alarm_count - count_value < kRearmCheckWindowUs) {
+        uint64_t now_count = count_value;
+        if (gptimer_get_raw_count(timer, &now_count) != ESP_OK || now_count < count_value) {
+            now_count = count_value;
+        }
+        while (next_alarm_count < now_count + kRearmMinLeadUs) {
+            next_alarm_count += static_cast<uint64_t>(kPeriodUs);
+            ++guard_skips;
+        }
+    }
+
     // Keep the sampling grid anchored to the original absolute GPTimer alarm
-    // sequence. If ISR work consumes the remaining margin and the new alarm is
-    // already in the past, the GPTimer driver triggers it immediately rather
-    // than moving the grid. This preserves the missed-period accounting.
+    // sequence: the deadline written here is always a grid point at least
+    // kRearmMinLeadUs ahead of the current count, so no target-specific
+    // past-alarm behaviour is involved and missed-period accounting stays exact.
     // CONFIG_GPTIMER_CTRL_FUNC_IN_IRAM makes gptimer_set_alarm_action()
     // callable while flash cache is disabled. Keep the config object itself in
     // DRAM as required by the driver cache-safety contract; only alarm_count
@@ -274,11 +319,34 @@ bool IRAM_ATTR OnAlarm(gptimer_handle_t timer,
     }
 
     if (!s_run_active) return false;
+    const uint64_t first_window_alarm = (s_run_begin_count / kPeriodUs + 1ULL) * kPeriodUs;
+    if (guard_skips != 0U) {
+        // Skipped deadlines are next_alarm_count - k*period, k = 1..guard_skips.
+        // Charge those inside (run_begin, now] so callbacks + missed periods
+        // still equal the grid deadlines in the monitored window.
+        s_rearm_guard_skips = s_rearm_guard_skips + guard_skips;
+        const uint64_t first_skipped =
+            next_alarm_count - static_cast<uint64_t>(guard_skips) * kPeriodUs;
+        uint32_t charged = 0U;
+        if (first_skipped >= first_window_alarm) {
+            charged = guard_skips;
+        } else if (next_alarm_count - kPeriodUs >= first_window_alarm) {
+            charged = static_cast<uint32_t>((next_alarm_count - first_window_alarm) / kPeriodUs);
+        }
+        if (UINT32_MAX - s_missed_periods < charged) {
+            s_missed_periods = UINT32_MAX;
+        } else {
+            s_missed_periods = s_missed_periods + charged;
+        }
+    }
+    const uint64_t first_charged_alarm = alarm_value > first_window_alarm ? alarm_value : first_window_alarm;
+    if (count_value < first_charged_alarm) return false;
+    const uint64_t missed_in_window = (count_value - first_charged_alarm) / kPeriodUs;
     s_sample_callbacks = s_sample_callbacks + 1U;
 
-    const uint32_t skipped_periods = skipped_periods64 > static_cast<uint64_t>(UINT32_MAX)
+    const uint32_t skipped_periods = missed_in_window > static_cast<uint64_t>(UINT32_MAX)
         ? UINT32_MAX
-        : static_cast<uint32_t>(skipped_periods64);
+        : static_cast<uint32_t>(missed_in_window);
     if (UINT32_MAX - s_missed_periods < skipped_periods) {
         s_missed_periods = UINT32_MAX;
     } else {
@@ -309,6 +377,10 @@ bool IRAM_ATTR OnAlarm(gptimer_handle_t timer,
     const uint32_t sequence = s_event_sequence + 1U;
     s_event_sequence = sequence;
     s_event_total_count = s_event_total_count + 1U;
+    // Raw handle comparisons only; no task-name lookup or allocation in ISR.
+    if (interrupted != nullptr && interrupted == s_rtc_task) s_rtc_events = s_rtc_events + 1U;
+    if (interrupted != nullptr && interrupted == s_wifi_task) s_wifi_events = s_wifi_events + 1U;
+    if (interrupted != nullptr && interrupted == s_udp_task) s_udp_events = s_udp_events + 1U;
 
     LatencyEvent event{};
     event.sequence = sequence;
@@ -316,7 +388,11 @@ bool IRAM_ATTR OnAlarm(gptimer_handle_t timer,
     event.actual_local_us = actual_local_us;
     event.expected_local_us = expected_local_us;
     event.interrupted_task = interrupted;
-    s_last_event = event;
+    s_last_event.sequence = event.sequence;
+    s_last_event.lateness_us = event.lateness_us;
+    s_last_event.expected_local_us = event.expected_local_us;
+    s_last_event.actual_local_us = event.actual_local_us;
+    s_last_event.interrupted_task = event.interrupted_task;
     s_last_event_valid = true;
 
     if (lateness_us > s_worst_event_lateness_us) {
@@ -327,7 +403,12 @@ bool IRAM_ATTR OnAlarm(gptimer_handle_t timer,
 
     const uint32_t retained = s_event_retained_count;
     if (retained < kEventCapacity) {
-        s_events[retained] = event;
+        LatencyEvent& stored = s_events[retained];
+        stored.sequence = event.sequence;
+        stored.lateness_us = event.lateness_us;
+        stored.expected_local_us = event.expected_local_us;
+        stored.actual_local_us = event.actual_local_us;
+        stored.interrupted_task = event.interrupted_task;
         s_event_retained_count = retained + 1U;
     } else {
         s_event_overflow = s_event_overflow + 1U;
@@ -336,7 +417,7 @@ bool IRAM_ATTR OnAlarm(gptimer_handle_t timer,
     if (s_timer_local_mapping_valid && s_last_commit_valid &&
         EventCouldOverlapCommit(event, s_last_commit.target_local_us)) {
         const int64_t commit_late64 =
-            s_last_commit.callback_entry_us - s_last_commit.target_local_us;
+            s_last_commit.marker_begin_us - s_last_commit.target_local_us;
         const uint32_t commit_lateness_us = commit_late64 <= 0
             ? 0U
             : (commit_late64 > static_cast<int64_t>(UINT32_MAX)
@@ -371,7 +452,9 @@ void TaskCanaryTask(void*) {
 
 #if defined(CONFIG_FACTORY_CPU0_LATENCY_TASK_CANARY_MIDSECOND) && CONFIG_FACTORY_CPU0_LATENCY_TASK_CANARY_MIDSECOND
         s_task_canary.boundary = 0;
-        const int64_t begin_target_us = s_run_begin_local_us + kTaskCanaryAfterRunUs;
+        // Validation offsets remain relative to visible START even though
+        // monitor accounting now includes the earlier ARMED interval.
+        const int64_t begin_target_us = s_tstar_local_us + kTaskCanaryAfterRunUs;
         s_task_canary.target_local_us = begin_target_us;
         while (s_run_active) {
             const int64_t now_us = esp_timer_get_time();
@@ -447,6 +530,20 @@ void BuildSummary() {
     cpu0_latency_monitor_summary_t summary{};
     summary.valid = (s_rearm_failures == 0 && s_timer_local_mapping_valid);
     summary.command_id = s_run_command_id;
+    summary.period_us = kPeriodUs;
+    summary.threshold_us = kThresholdUs;
+    summary.monitor_start_us = s_run_begin_local_us;
+    summary.tstar_local_us = s_tstar_local_us;
+    summary.monitor_end_us = s_run_end_local_us;
+    summary.first_alarm_offset_us = kPeriodUs - (s_run_begin_count % kPeriodUs);
+    // Exact absolute-grid endpoint convention: (start_count, end_count].
+    summary.expected_periods = s_run_end_count / kPeriodUs - s_run_begin_count / kPeriodUs;
+    summary.rtc_discipline_events_ge_50us = s_rtc_events;
+    summary.wifi_events_ge_50us = s_wifi_events;
+    summary.udp_events_ge_50us = s_udp_events;
+    summary.commit_ge_300us = s_commit_ge300;
+    summary.rearm_failures = s_rearm_failures;
+    summary.rearm_guard_skips = s_rearm_guard_skips;
     summary.sample_callbacks = s_sample_callbacks;
     summary.missed_periods = s_missed_periods;
     summary.event_count = s_event_total_count;
@@ -552,6 +649,16 @@ bool cpu0_latency_monitor_init() {
 #endif
 }
 
+void cpu0_latency_monitor_cache_task_inventory() {
+#if defined(CONFIG_FACTORY_CPU0_LATENCY_MONITOR) && CONFIG_FACTORY_CPU0_LATENCY_MONITOR
+    if (!s_initialized || s_task_inventory_cached || s_run_active) return;
+    RefreshTaskInventory();
+    s_task_inventory_cached = true;
+    ESP_LOGI(kTag, "CPU0_TASK_INVENTORY phase=boot cached=1 tasks=%u",
+             static_cast<unsigned>(s_task_inventory_count));
+#endif
+}
+
 void cpu0_latency_monitor_prepare_run(uint64_t command_id) {
 #if defined(CONFIG_FACTORY_CPU0_LATENCY_MONITOR) && CONFIG_FACTORY_CPU0_LATENCY_MONITOR
     if (!s_initialized) return;
@@ -560,6 +667,14 @@ void cpu0_latency_monitor_prepare_run(uint64_t command_id) {
     s_commit_target_local_us = 0;
     s_commit_target_boundary = 0;
     s_run_begin_local_us = 0;
+    s_run_end_local_us = 0;
+    s_tstar_local_us = 0;
+    s_run_begin_count = 0;
+    s_run_end_count = 0;
+    s_rtc_events = 0;
+    s_wifi_events = 0;
+    s_udp_events = 0;
+    s_commit_ge300 = 0;
     s_timer_to_local_offset_us = 0;
     s_timer_local_mapping_valid = false;
     s_event_sequence = 0;
@@ -569,6 +684,7 @@ void cpu0_latency_monitor_prepare_run(uint64_t command_id) {
     s_sample_callbacks = 0;
     s_missed_periods = 0;
     s_rearm_failures = 0;
+    s_rearm_guard_skips = 0;
     s_wrong_core_callbacks = 0;
     s_worst_event_lateness_us = 0;
     s_worst_event_sequence = 0;
@@ -593,13 +709,14 @@ void cpu0_latency_monitor_prepare_run(uint64_t command_id) {
     s_isr_canary = IsrCanaryRecord{};
     if (s_isr_canary_timer != nullptr) (void)esp_timer_stop(s_isr_canary_timer);
 #endif
-    std::memset(s_events, 0, sizeof(s_events));
-    std::memset(s_commit_events, 0, sizeof(s_commit_events));
+    for (auto& event : s_events) event = LatencyEvent{};
+    for (auto& event : s_commit_events) event = CommitLateEvent{};
     portENTER_CRITICAL(&s_summary_mux);
     s_summary = {};
     s_summary.command_id = command_id;
     portEXIT_CRITICAL(&s_summary_mux);
-    RefreshTaskInventory();
+    // Task identities were cached before accepting UDP commands. Retain them
+    // across runs; uxTaskGetSystemState() must not scan stacks at acceptance.
     ESP_LOGI(kTag,
              "CPU0_LATENCY_RUN_PREP command=%016llX task_inventory=%u task_canary=%u isr_canary=%u gpio_probe=off",
              static_cast<unsigned long long>(command_id),
@@ -619,10 +736,11 @@ void cpu0_latency_monitor_prepare_run(uint64_t command_id) {
 #endif
 }
 
-void cpu0_latency_monitor_begin_run(uint64_t command_id, int64_t start_disciplined_us) {
+void cpu0_latency_monitor_begin_run(uint64_t command_id, int64_t tstar_local_us) {
 #if defined(CONFIG_FACTORY_CPU0_LATENCY_MONITOR) && CONFIG_FACTORY_CPU0_LATENCY_MONITOR
     if (!s_initialized) return;
     s_run_command_id = command_id;
+    s_tstar_local_us = tstar_local_us;
 
     // Calibrate the free-running GPTimer count into the esp_timer local domain
     // before enabling run accounting. Use the midpoint of two esp_timer reads
@@ -638,6 +756,7 @@ void cpu0_latency_monitor_begin_run(uint64_t command_id, int64_t start_disciplin
             local_mid_us - static_cast<int64_t>(timer_count);
         s_timer_local_mapping_valid = true;
         s_run_begin_local_us = local_mid_us;
+        s_run_begin_count = timer_count;
     } else {
         s_timer_to_local_offset_us = 0;
         s_timer_local_mapping_valid = false;
@@ -652,17 +771,19 @@ void cpu0_latency_monitor_begin_run(uint64_t command_id, int64_t start_disciplin
     if (s_isr_canary_timer != nullptr) {
         (void)esp_timer_stop(s_isr_canary_timer);
         s_isr_canary.requested = true;
-        s_isr_canary.requested_after_begin_us = kIsrCanaryOffsetUs;
+        const int64_t canary_target_us = s_tstar_local_us + kIsrCanaryOffsetUs;
+        s_isr_canary.requested_after_begin_us = canary_target_us - s_run_begin_local_us;
         s_isr_canary.hold_us = kIsrCanaryHoldUs;
-        if (esp_timer_start_once(s_isr_canary_timer, kIsrCanaryOffsetUs) != ESP_OK) {
+        const int64_t delay_us = canary_target_us - esp_timer_get_time();
+        if (esp_timer_start_once(s_isr_canary_timer, delay_us > 0 ? delay_us : 1) != ESP_OK) {
             s_isr_canary.requested = false;
         }
     }
 #endif
     ESP_LOGI(kTag,
-             "CPU0_LATENCY_RUN_BEGIN command=%016llX start_disciplined_us=%lld task_inventory=%u heartbeat_traffic=%s task_canary=%u isr_canary=%u gpio_probe=off",
+             "CPU0_LATENCY_RUN_BEGIN command=%016llX tstar_local_us=%lld task_inventory=%u heartbeat_traffic=%s task_canary=%u isr_canary=%u gpio_probe=off",
              static_cast<unsigned long long>(command_id),
-             static_cast<long long>(start_disciplined_us),
+             static_cast<long long>(tstar_local_us),
              static_cast<unsigned>(s_task_inventory_count),
              kHeartbeatTraffic,
 #if defined(CONFIG_FACTORY_CPU0_LATENCY_TASK_CANARY) && CONFIG_FACTORY_CPU0_LATENCY_TASK_CANARY
@@ -677,19 +798,33 @@ void cpu0_latency_monitor_begin_run(uint64_t command_id, int64_t start_disciplin
 #endif
 #else
     (void)command_id;
-    (void)start_disciplined_us;
+    (void)tstar_local_us;
 #endif
 }
 
-void cpu0_latency_monitor_end_run() {
+void cpu0_latency_monitor_end_run(uint64_t command_id) {
 #if defined(CONFIG_FACTORY_CPU0_LATENCY_MONITOR) && CONFIG_FACTORY_CPU0_LATENCY_MONITOR
+    if (!s_run_active || (command_id != 0 && command_id != s_run_command_id)) return;
+    // All accounting owners and timer callbacks are on CPU0. Freeze the end
+    // snapshot with callbacks disabled, then resolve names outside the ISR path.
+    portENTER_CRITICAL(&s_summary_mux);
+    uint64_t end_count = 0;
+    if (gptimer_get_raw_count(s_timer, &end_count) != ESP_OK) {
+        s_rearm_failures = s_rearm_failures + 1U;
+        end_count = s_run_begin_count;
+    }
+    s_run_end_count = end_count;
+    s_run_end_local_us = s_run_begin_local_us + static_cast<int64_t>(end_count - s_run_begin_count);
     s_run_active = false;
     s_commit_target_local_us = 0;
     s_commit_target_boundary = 0;
+    portEXIT_CRITICAL(&s_summary_mux);
 #if defined(CONFIG_FACTORY_CPU0_LATENCY_ISR_CANARY) && CONFIG_FACTORY_CPU0_LATENCY_ISR_CANARY
     if (s_isr_canary_timer != nullptr) (void)esp_timer_stop(s_isr_canary_timer);
 #endif
     BuildSummary();
+#else
+    (void)command_id;
 #endif
 }
 
@@ -709,7 +844,10 @@ void IRAM_ATTR cpu0_latency_monitor_note_commit(uint32_t boundary,
                                                 int64_t marker_begin_us,
                                                 int64_t marker_end_us) {
 #if defined(CONFIG_FACTORY_CPU0_LATENCY_MONITOR) && CONFIG_FACTORY_CPU0_LATENCY_MONITOR
-    const int64_t lateness64 = callback_entry_us - target_local_us;
+    // Hard COMMIT delay concerns the actual publish entry. Callback-entry
+    // lateness is retained independently in CPU0_COMMIT_LATE detail.
+    const int64_t lateness64 = marker_begin_us - target_local_us;
+    if (s_run_active && lateness64 >= 300) s_commit_ge300 = s_commit_ge300 + 1U;
     if (!s_run_active || lateness64 < static_cast<int64_t>(kThresholdUs)) return;
 
     const uint32_t lateness_us = lateness64 > static_cast<int64_t>(UINT32_MAX)
@@ -791,7 +929,7 @@ void cpu0_latency_monitor_dump_run() {
              static_cast<unsigned>(summary.wrong_core_callbacks),
              static_cast<unsigned>(summary.event_overflow),
              static_cast<unsigned>(summary.commit_overflow),
-             static_cast<unsigned>(s_rearm_failures),
+             static_cast<unsigned>(summary.rearm_failures),
              static_cast<unsigned>(summary.sampler_intr_level),
              static_cast<unsigned>(summary.commit_intr_level),
 #if defined(CONFIG_FACTORY_CPU0_LATENCY_TASK_CANARY) && CONFIG_FACTORY_CPU0_LATENCY_TASK_CANARY
@@ -805,8 +943,26 @@ void cpu0_latency_monitor_dump_run() {
              0U);
 #endif
 
+    ESP_LOGI(kTag,
+             "CPU0_MONITOR_WINDOW command=%016llX monitor_start_us=%lld tstar_local_us=%lld monitor_start_to_tstar_us=%lld monitor_end_us=%lld monitor_elapsed_us=%lld first_alarm_offset_us=%u expected_periods=%llu cpu0_events_ge_50us=%u rtc_discipline_events_ge_50us=%u wifi_events_ge_50us=%u udp_events_ge_50us=%u commit_late_events=%u commit_ge_300us=%u rearm_guard_skips=%u",
+             static_cast<unsigned long long>(summary.command_id),
+             static_cast<long long>(summary.monitor_start_us),
+             static_cast<long long>(summary.tstar_local_us),
+             static_cast<long long>(summary.monitor_start_us - summary.tstar_local_us),
+             static_cast<long long>(summary.monitor_end_us),
+             static_cast<long long>(summary.monitor_end_us - summary.monitor_start_us),
+             static_cast<unsigned>(summary.first_alarm_offset_us),
+             static_cast<unsigned long long>(summary.expected_periods),
+             static_cast<unsigned>(summary.event_count),
+             static_cast<unsigned>(summary.rtc_discipline_events_ge_50us),
+             static_cast<unsigned>(summary.wifi_events_ge_50us),
+             static_cast<unsigned>(summary.udp_events_ge_50us),
+             static_cast<unsigned>(summary.commit_late_count),
+             static_cast<unsigned>(summary.commit_ge_300us),
+             static_cast<unsigned>(summary.rearm_guard_skips));
+
     // Preserve concise serial post-mortem detail when a board is connected,
-    // while fleet operation relies only on the STATUS summary fields.
+    // while fleet operation uses the compact STATUS and RUN_DIAG replies.
 #if defined(CONFIG_FACTORY_CPU0_LATENCY_TASK_CANARY) && CONFIG_FACTORY_CPU0_LATENCY_TASK_CANARY
     ESP_LOGI(kTag,
              "CPU0_LATENCY_CANARY requested=%u completed=%u mode=%s boundary=%u target_local_us=%lld critical_begin_us=%lld critical_end_us=%lld duration_us=%lld lead_us=%lld hold_us=%u task=lat_canary",

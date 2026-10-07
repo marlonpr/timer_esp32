@@ -44,6 +44,16 @@ config FACTORY_START_EDGE_GPIO
         GPIO connected to the external/ESP32 logic analyzer. GPIO21/22 are
         reserved for the DS3231 I2C bus in the disciplined-timing pilot.
 
+config FACTORY_START_TASK_TEST_DELAY_US
+    int "Qualification-only delay of the START task (microseconds)"
+    range 0 2000
+    default 0
+    help
+        Delays the START state transition after the scheduler reaches T*.
+        Interrupts remain enabled and the independent display COMMIT schedule
+        remains anchored to armed T*. Use 500 for the late-start epoch regression;
+        STARTED/StartError reports the actual delay. Normal fleet builds use 0.
+
 endmenu
 
 menu "Factory DS3231 disciplined timing"
@@ -202,7 +212,7 @@ config FACTORY_CPU0_LATENCY_MONITOR
 config FACTORY_CPU0_LATENCY_PERIOD_US
     int "CPU0 latency sample period (microseconds)"
     range 100 10000
-    default 250
+    default 251
     depends on FACTORY_CPU0_LATENCY_MONITOR
 
 config FACTORY_CPU0_LATENCY_THRESHOLD_US

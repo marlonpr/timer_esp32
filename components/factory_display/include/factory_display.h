@@ -11,22 +11,21 @@ extern "C" {
 // scheduler task. The panel shows the common 64x32 logo while idle.
 bool factory_display_init(const char* device_id, uint8_t brightness);
 
+// Cache task identities once after all application/Wi-Fi tasks exist and before
+// opening the command socket. No inventory or stack scan runs at ARM/RUNNING.
+void factory_display_cache_runtime_inventory(void);
+
 // Changes panel output brightness immediately without altering countdown state
 // or timing. Value is an operator-facing percentage from 0 (off) to 100.
 void factory_display_set_brightness_percent(uint8_t brightness_percent);
 
-// Arms the visual countdown against the SAME raw local START deadline used by
-// the countdown scheduler. START itself is unchanged. After START, each visible
-// one-second boundary is scheduled in the DS3231-disciplined time domain and
-// converted back to the current local esp_timer deadline.
-void factory_display_arm(int64_t local_start_us, uint32_t duration_seconds,
-                         uint64_t command_id);
+// Start accounting at command acceptance, before temperature suppression and ARM.
+void factory_display_begin_run_monitor(uint64_t command_id, int64_t local_start_us);
 
-// Publishes the exact disciplined START epoch captured by the high-priority
-// countdown TimerTask. This does not control the first visible START frame; it
-// only anchors post-START one-second boundaries.
-void factory_display_note_started(uint64_t command_id,
-                                  int64_t start_disciplined_us);
+// The immutable disciplined T* and its initial raw-local deadline come from ARM.
+// Every scheduled boundary, including 0, uses T* + n * 1000000 us.
+void factory_display_arm(int64_t local_start_us, int64_t start_disciplined_us,
+                         uint32_t duration_seconds, uint64_t command_id);
 
 // Cancels any pending/running visual countdown and returns to the idle frame.
 void factory_display_reset(void);

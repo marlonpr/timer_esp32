@@ -1,11 +1,13 @@
 #include "command_processor.h"
 #include "factory_log.h"
 #include "factory_display.h"
+#include "cpu0_latency_monitor.h"
 #include "flash_guard_diag.h"
 #include "network_policy.h"
 #include "protocol_codec.h"
 #include "ds3231.h"
 #include "rtc_discipline.h"
+#include "start_task_test_delay.h"
 
 #include <atomic>
 #include <cerrno>
@@ -792,9 +794,43 @@ bool RtcRunGateQualified(rtc_discipline_status_t *out_status = nullptr) {
 #endif
 }
 
+void SendRunDiagnostic(int socket_fd, const sockaddr_in& peer, uint64_t command_id) {
+    cpu0_latency_monitor_summary_t m{};
+    cpu0_latency_monitor_get_summary(&m);
+    if (m.command_id != command_id || m.monitor_end_us <= m.monitor_start_us) return;
+    factory_timer::RunDiagnosticFields f{};
+    f.valid = m.valid;
+    f.period_us = m.period_us;
+    f.threshold_us = m.threshold_us;
+    f.monitor_start_us = m.monitor_start_us;
+    f.tstar_local_us = m.tstar_local_us;
+    f.monitor_end_us = m.monitor_end_us;
+    f.first_alarm_offset_us = m.first_alarm_offset_us;
+    f.expected_periods = m.expected_periods;
+    f.sample_callbacks = m.sample_callbacks;
+    f.missed_periods = m.missed_periods;
+    f.cpu0_events_ge_50us = m.event_count;
+    f.rtc_discipline_events_ge_50us = m.rtc_discipline_events_ge_50us;
+    f.wifi_events_ge_50us = m.wifi_events_ge_50us;
+    f.udp_events_ge_50us = m.udp_events_ge_50us;
+    f.commit_late_events = m.commit_late_count;
+    f.commit_ge_300us = m.commit_ge_300us;
+    f.rearm_failures = m.rearm_failures;
+    char packet[factory_timer::kMaxPacketLength + 1]{};
+    const int length = factory_timer::FormatRunDiagnostic(packet, sizeof(packet),
+        CONFIG_FACTORY_DEVICE_ID, command_id, f);
+    SendPacket(socket_fd, peer, packet, length, "RUN_DIAG");
+}
+
 void SendStatus(int socket_fd, const sockaddr_in &peer,
                 const factory_timer::TimerSnapshot &snapshot,
                 StatusSendTiming *timing = nullptr) {
+    // STATUS_REQUEST can itself observe the RUNNING -> FINISHED transition.
+    // Apply the freshness barrier here as well as in the finished-event path.
+#if defined(CONFIG_FACTORY_DS3231_DISCIPLINE) && CONFIG_FACTORY_DS3231_DISCIPLINE
+    if (snapshot.state == factory_timer::TimerState::Finished &&
+        !rtc_discipline_finish_run_temperature(snapshot.last_command_id, esp_timer_get_time())) return;
+#endif
     if (timing != nullptr) timing->send_status_begin_us = esp_timer_get_time();
     if (timing != nullptr) timing->wifi_diag_begin_us = esp_timer_get_time();
     const WifiDiagnostics diagnostics = ReadWifiDiagnostics();
@@ -884,6 +920,9 @@ void SendStatus(int socket_fd, const sockaddr_in &peer,
                timing != nullptr ? &timing->sendto_entry_us : nullptr,
                timing != nullptr ? &timing->sendto_return_us : nullptr);
     if (timing != nullptr) timing->send_status_end_us = esp_timer_get_time();
+    if (snapshot.state == factory_timer::TimerState::Finished) {
+        SendRunDiagnostic(socket_fd, peer, snapshot.last_command_id);
+    }
 }
 
 #if defined(CONFIG_FACTORY_START_EDGE_DIAGNOSTICS) && CONFIG_FACTORY_START_EDGE_DIAGNOSTICS
@@ -1238,6 +1277,13 @@ void TimerTask(void *) {
                 now = esp_timer_get_time();
             } while (now < target_local_us);
 
+#if defined(CONFIG_FACTORY_START_TASK_TEST_DELAY_US) && CONFIG_FACTORY_START_TASK_TEST_DELAY_US > 0
+            // Qualification-only late wake. Interrupts remain enabled, so the
+            // independent COMMIT ISR still publishes boundary 0 at armed T*.
+            // Capture the actual delayed time for STARTED/StartError telemetry.
+            now = factory_timer::InjectStartTaskTestDelay();
+#endif
+
             TimerStartEvent event{};
             bool started = false;
 
@@ -1299,12 +1345,6 @@ void TimerTask(void *) {
             }
             xSemaphoreGive(countdown_mutex);
 
-#if defined(CONFIG_FACTORY_DISPLAY_TEST) && CONFIG_FACTORY_DISPLAY_TEST
-            if (started) {
-                factory_display_note_started(event.snapshot.last_command_id,
-                                             event.actual_disciplined_start_us);
-            }
-#endif
             if (started) {
                 // Positive-control diagnostics are launched only after the exact
                 // Armed -> Running transition and never execute NVS work here.
@@ -1745,6 +1785,11 @@ void LogAcceptedCommand(const factory_timer::CommandPacket &command,
 void CommandTask(void *) {
     xEventGroupWaitBits(wifi_event_group, kWifiConnectedBit, pdFALSE, pdTRUE,
                         portMAX_DELAY);
+#if defined(CONFIG_FACTORY_DISPLAY_TEST) && CONFIG_FACTORY_DISPLAY_TEST
+    // All application and Wi-Fi tasks now exist. Finish the one-time task/stack
+    // scans before opening the socket, so START_AT cannot overlap an inventory.
+    factory_display_cache_runtime_inventory();
+#endif
     const int socket_fd = CreateCommandSocket();
     if (socket_fd < 0) {
         ESP_LOGE(kTag, "UDP task stopping because the socket could not be created");
@@ -1944,10 +1989,11 @@ void CommandTask(void *) {
                         SendStatus(socket_fd, peer, snapshot);
                     } else {
                         int64_t local_start_us = 0;
+                        int64_t target_disciplined_us = 0;
                         if (command.type == factory_timer::CommandType::StartAt) {
                             if (clock_sync.offset_epoch_disciplined_us > 0 &&
                                 clock_sync.estimated_master_epoch_us > 0) {
-                                const int64_t target_disciplined_us =
+                                target_disciplined_us =
                                     clock_sync.offset_epoch_disciplined_us +
                                     (command.start_at_master_us -
                                      clock_sync.estimated_master_epoch_us);
@@ -2041,14 +2087,27 @@ void CommandTask(void *) {
                                         : 0;
                                 ResetNetworkTimingDiagnostics();
                                 ResetNetworkSilentDiagnostics();
-                                ArmStartTimerLocked(countdown.ScheduledStartMicroseconds());
+                                const int64_t armed_local_us = countdown.ScheduledStartMicroseconds();
+                                if (target_disciplined_us == 0) {
+                                    target_disciplined_us = rtc_discipline_local_to_disciplined_us(armed_local_us);
+                                }
 #if defined(CONFIG_FACTORY_DISPLAY_TEST) && CONFIG_FACTORY_DISPLAY_TEST
-                                factory_display_arm(countdown.ScheduledStartMicroseconds(),
+                                factory_display_begin_run_monitor(command.command_id, armed_local_us);
+#endif
+#if defined(CONFIG_FACTORY_DS3231_DISCIPLINE) && CONFIG_FACTORY_DS3231_DISCIPLINE
+                                rtc_discipline_begin_run(command.command_id);
+#endif
+                                ArmStartTimerLocked(armed_local_us);
+#if defined(CONFIG_FACTORY_DISPLAY_TEST) && CONFIG_FACTORY_DISPLAY_TEST
+                                factory_display_arm(armed_local_us, target_disciplined_us,
                                                     processing.snapshot.duration_seconds,
                                                     command.command_id);
 #endif
                             } else if (command.type == factory_timer::CommandType::Reset) {
                                 last_start_health = {};
+#if defined(CONFIG_FACTORY_DS3231_DISCIPLINE) && CONFIG_FACTORY_DS3231_DISCIPLINE
+                                rtc_discipline_cancel_run();
+#endif
                                 SetStartDiagnosticEdge(false);
 #if defined(CONFIG_FACTORY_DISPLAY_TEST) && CONFIG_FACTORY_DISPLAY_TEST
                                 factory_display_reset();
@@ -2202,6 +2261,9 @@ void CommandTask(void *) {
             } else if (snapshot.state == factory_timer::TimerState::Finished) {
                 ESP_LOGI(kTag, "Countdown finished: command=%016llX",
                          static_cast<unsigned long long>(snapshot.last_command_id));
+#if defined(CONFIG_FACTORY_DS3231_DISCIPLINE) && CONFIG_FACTORY_DS3231_DISCIPLINE
+                (void)rtc_discipline_finish_run_temperature(snapshot.last_command_id, now);
+#endif
                 flash_guard_diag_countdown_finished();
                 RequestPostRunDiagnosticDump();
             }
@@ -2301,6 +2363,10 @@ extern "C" void app_main() {
     }
     ESP_LOGI(kTag, "Factory countdown timer starting");
     ESP_LOGI(kTag, "Configured device identity: %s", CONFIG_FACTORY_DEVICE_ID);
+#if defined(CONFIG_FACTORY_START_TASK_TEST_DELAY_US) && CONFIG_FACTORY_START_TASK_TEST_DELAY_US > 0
+    ESP_LOGW(kTag, "START_TASK_DELAY_TEST enabled delay_us=%u diagnostic_only=1",
+             static_cast<unsigned>(CONFIG_FACTORY_START_TASK_TEST_DELAY_US));
+#endif
     InitialiseNvs();
     flash_guard_diag_init();
     InitialiseDieTemperatureSensor();

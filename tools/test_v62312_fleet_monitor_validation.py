@@ -7,7 +7,7 @@ h=(ROOT/'components/factory_display/cpu0_latency_monitor.h').read_text()
 k=(ROOT/'main/Kconfig.projbuild').read_text()
 fd=(ROOT/'components/factory_display/factory_display.cpp').read_text()
 checks={
- '4kHz period default': 'default 250' in k and 'CONFIG_FACTORY_CPU0_LATENCY_PERIOD_US' in cpp,
+ '251us period default': 'default 251' in k and 'CONFIG_FACTORY_CPU0_LATENCY_PERIOD_US' in cpp,
  '50us threshold default': 'default 50' in k,
  'task canary option default off': 'config FACTORY_CPU0_LATENCY_TASK_CANARY' in k and 'default n' in k[k.index('config FACTORY_CPU0_LATENCY_TASK_CANARY'):k.index('config FACTORY_CPU0_LATENCY_CANARY_BOUNDARY')],
  'ISR canary option default off': 'config FACTORY_CPU0_LATENCY_ISR_CANARY' in k,

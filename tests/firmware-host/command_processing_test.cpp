@@ -3,6 +3,7 @@
 #include "network_policy.h"
 #include "protocol_codec.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <string_view>
@@ -204,6 +205,32 @@ void CheckProtocolFormats() {
         UINT32_MAX, "deadbeef");
     CHECK(length > 0);
     CHECK(static_cast<std::size_t>(length) <= factory_timer::kMaxPacketLength);
+    std::cout << "STATUS_MAX_WIDTH_BYTES=" << length
+              << " STATUS_PLUS_SIX_HEX_COUNTERS_BYTES=" << length + 6 * 9 << '\n';
+    // The new counters/windows are deliberately separate from STATUS.
+    factory_timer::RunDiagnosticFields diagnostic{};
+    diagnostic.valid = true;
+    diagnostic.period_us = UINT32_MAX;
+    diagnostic.threshold_us = UINT32_MAX;
+    diagnostic.monitor_start_us = INT64_MIN;
+    diagnostic.tstar_local_us = INT64_MIN;
+    diagnostic.monitor_end_us = INT64_MIN;
+    diagnostic.first_alarm_offset_us = UINT32_MAX;
+    diagnostic.expected_periods = UINT64_MAX;
+    diagnostic.sample_callbacks = UINT32_MAX;
+    diagnostic.missed_periods = UINT32_MAX;
+    diagnostic.cpu0_events_ge_50us = UINT32_MAX;
+    diagnostic.rtc_discipline_events_ge_50us = UINT32_MAX;
+    diagnostic.wifi_events_ge_50us = UINT32_MAX;
+    diagnostic.udp_events_ge_50us = UINT32_MAX;
+    diagnostic.commit_late_events = UINT32_MAX;
+    diagnostic.commit_ge_300us = UINT32_MAX;
+    diagnostic.rearm_failures = UINT32_MAX;
+    length = factory_timer::FormatRunDiagnostic(packet, sizeof(packet),
+        "ESP1234567890123", UINT64_MAX, diagnostic);
+    CHECK(length > 0 && static_cast<std::size_t>(length) <= factory_timer::kMaxPacketLength);
+    std::cout << "RUN_DIAG_MAX_WIDTH_BYTES=" << length << '\n';
+    CHECK(std::count(packet, packet + length, '|') == 20);
 
     length = factory_timer::FormatSyncReply(
         packet, sizeof(packet), "ESP02", 0x0123456789abcdefULL,

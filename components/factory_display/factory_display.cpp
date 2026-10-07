@@ -67,7 +67,7 @@ constexpr int64_t kRuntimeSnapshotMinimumMarginUs = 1500;
 constexpr size_t kBoundaryTraceCapacity = 64;
 
 #if CONFIG_IDF_TARGET_ESP32
-constexpr size_t kIsrPublishTraceFirstCapacity = 8;
+constexpr size_t kIsrPublishTraceFirstCapacity = 32;
 constexpr size_t kIsrPublishTraceWorstCapacity = 8;
 constexpr size_t kIsrPublishTraceCapacity =
     kIsrPublishTraceFirstCapacity + kIsrPublishTraceWorstCapacity;
@@ -88,13 +88,9 @@ constexpr size_t kIsrPublishTraceCapacity =
 struct DisplayCommand {
     enum class Type : uint8_t { Arm, Reset } type{Type::Reset};
     int64_t local_start_us{};
+    int64_t start_disciplined_us{};
     uint32_t duration_seconds{};
     uint64_t command_id{};
-};
-
-struct DisplayStartAnchor {
-    uint64_t command_id{};
-    int64_t start_disciplined_us{};
 };
 
 struct BoundaryTraceRecord {
@@ -207,7 +203,6 @@ struct PrecisionWindowTrace {
 #endif
 
 QueueHandle_t s_command_queue = nullptr;
-QueueHandle_t s_start_anchor_queue = nullptr;
 TaskHandle_t s_display_task = nullptr;
 std::atomic<bool> s_ready{false};
 
@@ -267,6 +262,7 @@ bool s_commit_delay_diagnostic_overflow = false;
 RuntimeTaskRef s_runtime_tasks[kMaxRuntimeTasks]{};
 size_t s_runtime_task_count = 0;
 std::atomic<bool> s_runtime_inventory_ready{false};
+bool s_runtime_inventory_attempted = false;
 MarkerGapDiagnostic s_marker_gap_diagnostics[kMarkerGapDiagnosticCapacity]{};
 size_t s_marker_gap_diagnostic_count = 0;
 bool s_marker_gap_diagnostic_overflow = false;
@@ -537,11 +533,12 @@ void LogIsrPublishTraceRecord(const IsrPublishTraceRecord& r, const char* retent
              retention);
 }
 
-void DumpIsrPublishTrace() {
+void DumpIsrPublishTrace(uint64_t command_id) {
     const size_t retained_count =
         s_isr_publish_trace_first_count + s_isr_publish_trace_worst_count;
     ESP_LOGI(kTag,
-             "ISR_PUBLISH_TRACE_BEGIN count=%u capacity=%u total=%u first=%u worst=%u overflow=%u frame_not_ready=%u",
+             "ISR_PUBLISH_TRACE_BEGIN command=%016llX count=%u capacity=%u total=%u first=%u worst=%u overflow=%u frame_not_ready=%u",
+             static_cast<unsigned long long>(command_id),
              static_cast<unsigned>(retained_count),
              static_cast<unsigned>(kIsrPublishTraceCapacity),
              static_cast<unsigned>(s_isr_publish_trace_total),
@@ -572,6 +569,10 @@ uint64_t RuntimeCounterDelta(configRUN_TIME_COUNTER_TYPE before,
 }
 
 void RefreshRuntimeTaskInventory() {
+    // Called once during startup, before the UDP command socket is opened.
+    // uxTaskGetSystemState() includes a stack scan; never repeat it at ARM.
+    if (s_runtime_inventory_attempted) return;
+    s_runtime_inventory_attempted = true;
     constexpr UBaseType_t kScanCapacity = 48;
     TaskStatus_t task_status[kScanCapacity]{};
     configRUN_TIME_COUNTER_TYPE total_runtime = 0;
@@ -609,7 +610,7 @@ void RefreshRuntimeTaskInventory() {
     s_runtime_task_count = stored;
     s_runtime_inventory_ready.store(stored > 0);
     ESP_LOGI(kTag,
-             "Marker-gap runtime inventory ready: core0_or_unpinned_tasks=%u total_tasks=%u",
+             "Marker-gap runtime inventory ready: phase=boot cached=1 core0_or_unpinned_tasks=%u total_tasks=%u",
              static_cast<unsigned>(stored),
              static_cast<unsigned>(found));
 }
@@ -1185,39 +1186,6 @@ bool WaitUntilDisciplinedOrReplacement(int64_t disciplined_deadline_us,
     }
 }
 
-bool ReceiveStartAnchor(uint64_t command_id,
-                        int64_t fallback_start_disciplined_us,
-                        int64_t* start_disciplined_us) {
-    if (start_disciplined_us == nullptr) return false;
-
-    // The TimerTask owns the actual Armed -> Running transition. On the S3 the
-    // display task runs on the other core and can reach the first flip slightly
-    // before that task publishes its epoch, so allow a short bounded wait after
-    // the visible START. This does not move the first frame deadline.
-    DisplayStartAnchor anchor{};
-    if (s_start_anchor_queue != nullptr) {
-        for (int attempt = 0; attempt < 10; ++attempt) {
-            if (xQueueReceive(s_start_anchor_queue, &anchor,
-                              pdMS_TO_TICKS(10)) != pdTRUE) {
-                continue;
-            }
-            if (anchor.command_id == command_id &&
-                anchor.start_disciplined_us > 0) {
-                *start_disciplined_us = anchor.start_disciplined_us;
-                return true;
-            }
-            // A superseded command can race with a new arm on the other core.
-            // Discard a stale anchor and continue waiting for the current one.
-        }
-    }
-
-    *start_disciplined_us = fallback_start_disciplined_us;
-    ESP_LOGW(kTag,
-             "Disciplined START anchor unavailable/mismatched for command=%016llX; using local-deadline conversion",
-             static_cast<unsigned long long>(command_id));
-    return false;
-}
-
 void DisplayTask(void*) {
     DisplayCommand command{};
 
@@ -1268,25 +1236,19 @@ void DisplayTask(void*) {
         factory_display_backend_flip();
         RenderRunningToBackBuffer(command.duration_seconds);
 
-        // Refresh the task inventory once per armed run, several seconds
-        // before START. The expensive system-state enumeration therefore never
-        // runs in the precision window.
-        RefreshRuntimeTaskInventory();
-#if CONFIG_IDF_TARGET_ESP32
-        cpu0_latency_monitor_prepare_run(command.command_id);
-#endif
+        // Runtime task identities were cached before the command socket opened.
+        // ARM and RUNNING must not call uxTaskGetSystemState() or scan stacks.
 
+        [[maybe_unused]] const uint64_t monitored_command_id = command.command_id;
         DisplayCommand replacement{};
 
         // START uses the exact same ISR pending-frame publication path as the
         // subsequent one-second boundaries. The master/TimerTask START path is
         // unchanged; the refresh task makes the prepared frame visible only at
         // its next complete HUB75 scan boundary.
-        int64_t start_disciplined_us = 0;
-        const int64_t fallback_start_disciplined_us =
-            rtc_discipline_local_to_disciplined_us(command.local_start_us);
+        const int64_t start_disciplined_us = command.start_disciplined_us;
         int64_t commit_lateness_us = 0;
-        int64_t worst_flip_lateness_us = 0;
+        [[maybe_unused]] int64_t worst_flip_lateness_us = 0;
         bool superseded = false;
 
 #if CONFIG_IDF_TARGET_ESP32
@@ -1295,7 +1257,7 @@ void DisplayTask(void*) {
         int64_t start_arm_us = 0;
         if (!ArmBoundaryPublish(0,
                                 start_sequence,
-                                fallback_start_disciplined_us,
+                                start_disciplined_us,
                                 command.local_start_us,
                                 &start_arm_us)) {
             ESP_LOGE(kTag, "START display ISR timer arm failed; falling back to task publication");
@@ -1311,7 +1273,7 @@ void DisplayTask(void*) {
             IsrPublishTraceRecord fallback{};
             fallback.boundary = 0;
             fallback.sequence = start_sequence;
-            fallback.disciplined_us = fallback_start_disciplined_us;
+            fallback.disciplined_us = start_disciplined_us;
             fallback.target_local_us = PresentationTargetLocalUs(command.local_start_us);
             fallback.arm_us = start_arm_us;
             fallback.callback_entry_us = begin_us;
@@ -1333,10 +1295,10 @@ void DisplayTask(void*) {
                 continue;
             }
             const int64_t start_post_local_us =
-                rtc_discipline_disciplined_to_local_us(fallback_start_disciplined_us);
+                rtc_discipline_disciplined_to_local_us(start_disciplined_us);
             RecordIsrPublishTrace(0,
                                   start_sequence,
-                                  fallback_start_disciplined_us,
+                                  start_disciplined_us,
                                   PresentationTargetLocalUs(command.local_start_us),
                                   start_arm_us,
                                   PresentationTargetLocalUs(start_post_local_us));
@@ -1347,10 +1309,6 @@ void DisplayTask(void*) {
         }
         s_prepared_sequence.store(0, std::memory_order_release);
 
-        ReceiveStartAnchor(command.command_id,
-                           fallback_start_disciplined_us,
-                           &start_disciplined_us);
-        cpu0_latency_monitor_begin_run(command.command_id, start_disciplined_us);
 
         ESP_LOGI(kTag,
                  "Visual countdown started: duration=%u target_local_us=%lld start_isr_publish_lateness_us=%lld frame_not_ready=%u",
@@ -1383,8 +1341,6 @@ void DisplayTask(void*) {
         QueueMarkerGapDiagnostic(0, command.local_start_us, start_flip_commit_us,
                                  start_toggle_before_us, start_toggle_after_us,
                                  no_previous_runtime_snapshot, previous_runtime_snapshot);
-        ReceiveStartAnchor(command.command_id, fallback_start_disciplined_us,
-                           &start_disciplined_us);
         commit_lateness_us = start_flip_commit_us - command.local_start_us;
         worst_flip_lateness_us = commit_lateness_us;
         ESP_LOGI(kTag,
@@ -1567,7 +1523,7 @@ void DisplayTask(void*) {
 
 #endif
 #if CONFIG_IDF_TARGET_ESP32
-        cpu0_latency_monitor_end_run();
+        cpu0_latency_monitor_end_run(monitored_command_id);
 #endif
         if (!superseded) {
 #if CONFIG_IDF_TARGET_ESP32
@@ -1598,7 +1554,7 @@ void DisplayTask(void*) {
             // Dump only after the run. No per-boundary UART logging occurs in
             // the precision path.
 #if CONFIG_IDF_TARGET_ESP32
-            DumpIsrPublishTrace();
+            DumpIsrPublishTrace(command.command_id);
             cpu0_latency_monitor_dump_run();
 #else
             DumpBoundaryTrace();
@@ -1644,8 +1600,7 @@ extern "C" bool factory_display_init(const char* device_id, uint8_t brightness) 
 #endif
 
     s_command_queue = xQueueCreate(1, sizeof(DisplayCommand));
-    s_start_anchor_queue = xQueueCreate(1, sizeof(DisplayStartAnchor));
-    if (s_command_queue == nullptr || s_start_anchor_queue == nullptr) {
+    if (s_command_queue == nullptr) {
         ESP_LOGE(kTag, "Could not create display scheduler queues");
         return false;
     }
@@ -1715,15 +1670,14 @@ extern "C" void factory_display_set_brightness_percent(uint8_t brightness_percen
 }
 
 extern "C" void factory_display_arm(int64_t local_start_us,
+                                      int64_t start_disciplined_us,
                                       uint32_t duration_seconds,
                                       uint64_t command_id) {
     if (!s_ready.load() || s_command_queue == nullptr) return;
-    if (s_start_anchor_queue != nullptr) {
-        xQueueReset(s_start_anchor_queue);
-    }
     DisplayCommand command{};
     command.type = DisplayCommand::Type::Arm;
     command.local_start_us = local_start_us;
+    command.start_disciplined_us = start_disciplined_us;
     command.duration_seconds = duration_seconds;
     command.command_id = command_id;
     xQueueOverwrite(s_command_queue, &command);
@@ -1732,23 +1686,27 @@ extern "C" void factory_display_arm(int64_t local_start_us,
 #endif
 }
 
-extern "C" void factory_display_note_started(uint64_t command_id,
-                                               int64_t start_disciplined_us) {
-    if (!s_ready.load() || s_start_anchor_queue == nullptr ||
-        command_id == 0 || start_disciplined_us <= 0) {
-        return;
-    }
-    DisplayStartAnchor anchor{};
-    anchor.command_id = command_id;
-    anchor.start_disciplined_us = start_disciplined_us;
-    xQueueOverwrite(s_start_anchor_queue, &anchor);
+extern "C" void factory_display_cache_runtime_inventory(void) {
+    if (!s_ready.load()) return;
+    RefreshRuntimeTaskInventory();
+#if CONFIG_IDF_TARGET_ESP32
+    cpu0_latency_monitor_cache_task_inventory();
+#endif
+}
+
+extern "C" void factory_display_begin_run_monitor(uint64_t command_id,
+                                                        int64_t local_start_us) {
+#if CONFIG_IDF_TARGET_ESP32
+    cpu0_latency_monitor_prepare_run(command_id);
+    cpu0_latency_monitor_begin_run(command_id, local_start_us);
+#else
+    (void)command_id;
+    (void)local_start_us;
+#endif
 }
 
 extern "C" void factory_display_reset(void) {
     if (!s_ready.load() || s_command_queue == nullptr) return;
-    if (s_start_anchor_queue != nullptr) {
-        xQueueReset(s_start_anchor_queue);
-    }
     DisplayCommand command{};
     command.type = DisplayCommand::Type::Reset;
     xQueueOverwrite(s_command_queue, &command);

@@ -57,6 +57,14 @@ typedef struct {
     QueueHandle_t edge_queue;
     TaskHandle_t task;
     int64_t init_local_us;
+    SemaphoreHandle_t temperature_mutex;
+    bool temperature_suppressed;
+    uint64_t temperature_run_command_id;
+    bool post_run_temperature_ready;
+    int64_t finished_local_us;
+    /* v6.23.17 evidence for the START_AT..FINISHED suppression window. */
+    uint32_t run_periodic_reads;      /* periodic I2C reads while a run is registered: must stay 0 */
+    uint32_t run_suppressed_refreshes;/* periodic refreshes skipped by suppression */
 
     portMUX_TYPE mux;
     int64_t anchor_local_us;
@@ -426,15 +434,95 @@ static bool fit_rate(double *slope_us_per_second, double *rms_us)
     return true;
 }
 
-static void refresh_temperature(void)
+/* Caller owns temperature_mutex; no I2C operation occurs under the spinlock. */
+static esp_err_t read_temperature_now(void)
 {
     float temperature_c = 0.0f;
-    if (ds3231_get_temperature_c(s_ctx.rtc, &temperature_c) == ESP_OK) {
-        taskENTER_CRITICAL(&s_ctx.mux);
+    const esp_err_t result = ds3231_get_temperature_c(s_ctx.rtc, &temperature_c);
+    const int64_t read_us = esp_timer_get_time();
+    taskENTER_CRITICAL(&s_ctx.mux);
+    s_ctx.status.rtc_temperature_valid = result == ESP_OK;
+    if (result == ESP_OK) {
         s_ctx.status.rtc_temperature_c = temperature_c;
-        s_ctx.status.rtc_temperature_valid = true;
-        taskEXIT_CRITICAL(&s_ctx.mux);
+        s_ctx.status.rtc_temperature_sample_local_us = read_us;
     }
+    taskEXIT_CRITICAL(&s_ctx.mux);
+    return result;
+}
+
+static void refresh_temperature(void)
+{
+    xSemaphoreTake(s_ctx.temperature_mutex, portMAX_DELAY);
+    if (s_ctx.temperature_suppressed) {
+        s_ctx.run_suppressed_refreshes++;
+    } else {
+        /* Tripwire: suppression should make this unreachable between
+         * START_AT acceptance and the post-run read. */
+        if (s_ctx.temperature_run_command_id != 0 && !s_ctx.post_run_temperature_ready) {
+            s_ctx.run_periodic_reads++;
+        }
+        (void)read_temperature_now();
+    }
+    xSemaphoreGive(s_ctx.temperature_mutex);
+}
+
+void rtc_discipline_begin_run(uint64_t command_id)
+{
+    if (!s_ctx.initialized) return;
+    xSemaphoreTake(s_ctx.temperature_mutex, portMAX_DELAY);
+    s_ctx.temperature_suppressed = true;
+    s_ctx.temperature_run_command_id = command_id;
+    s_ctx.post_run_temperature_ready = false;
+    s_ctx.finished_local_us = 0;
+    s_ctx.run_periodic_reads = 0;
+    s_ctx.run_suppressed_refreshes = 0;
+    xSemaphoreGive(s_ctx.temperature_mutex);
+}
+
+void rtc_discipline_cancel_run(void)
+{
+    if (!s_ctx.initialized) return;
+    xSemaphoreTake(s_ctx.temperature_mutex, portMAX_DELAY);
+    s_ctx.temperature_suppressed = false;
+    s_ctx.temperature_run_command_id = 0;
+    s_ctx.post_run_temperature_ready = false;
+    xSemaphoreGive(s_ctx.temperature_mutex);
+}
+
+bool rtc_discipline_finish_run_temperature(uint64_t command_id, int64_t finished_local_us)
+{
+    if (!s_ctx.initialized) return false;
+    xSemaphoreTake(s_ctx.temperature_mutex, portMAX_DELAY);
+    if (s_ctx.temperature_run_command_id != command_id) {
+        xSemaphoreGive(s_ctx.temperature_mutex);
+        return false;
+    }
+    if (!s_ctx.post_run_temperature_ready) {
+        if (s_ctx.finished_local_us == 0) s_ctx.finished_local_us = finished_local_us;
+        const esp_err_t result = read_temperature_now();
+        if (result != ESP_OK) {
+            xSemaphoreGive(s_ctx.temperature_mutex);
+            ESP_LOGW(TAG, "RTC_TEMP_POST_RUN_FAILED command=%016llX error=%s",
+                     (unsigned long long)command_id, esp_err_to_name(result));
+            return false;
+        }
+        rtc_discipline_status_t status;
+        rtc_discipline_get_status(&status);
+        ESP_LOGI(TAG,
+                 "RTC_TEMP_POST_RUN command=%016llX finished_local_us=%lld read_local_us=%lld temp_c=%.2f delay_us=%lld periodic_reads_during_run=%u suppressed_refreshes=%u",
+                 (unsigned long long)command_id,
+                 (long long)s_ctx.finished_local_us,
+                 (long long)status.rtc_temperature_sample_local_us,
+                 (double)status.rtc_temperature_c,
+                 (long long)(status.rtc_temperature_sample_local_us - s_ctx.finished_local_us),
+                 (unsigned)s_ctx.run_periodic_reads,
+                 (unsigned)s_ctx.run_suppressed_refreshes);
+        /* Publish readiness only after the I2C result/cache/timestamp are installed. */
+        s_ctx.post_run_temperature_ready = true;
+        s_ctx.temperature_suppressed = false;
+    }
+    xSemaphoreGive(s_ctx.temperature_mutex);
+    return true;
 }
 
 static void maybe_clear_osf_after_sane_edges(void)
@@ -798,6 +886,8 @@ esp_err_t rtc_discipline_init(ds3231_dev_t *rtc,
         return ESP_ERR_INVALID_ARG;
     }
 
+    s_ctx.temperature_mutex = xSemaphoreCreateMutex();
+    if (!s_ctx.temperature_mutex) return ESP_ERR_NO_MEM;
     s_ctx.rtc = rtc;
     s_ctx.cfg = *config;
     reset_fit();

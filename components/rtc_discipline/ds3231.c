@@ -211,12 +211,13 @@ esp_err_t ds3231_clear_oscillator_stop_flag(ds3231_dev_t *dev)
 
 esp_err_t ds3231_get_temperature_c(ds3231_dev_t *dev, float *temperature_c)
 {
-    if (!dev || !temperature_c) {
+    if (!dev || !dev->dev || !temperature_c) {
         return ESP_ERR_INVALID_ARG;
     }
 
     uint8_t raw[2];
-    esp_err_t err = ds3231_read_regs(dev, DS3231_REG_TEMP_MSB, raw, sizeof(raw));
+    const uint8_t reg = DS3231_REG_TEMP_MSB;
+    esp_err_t err = i2c_master_transmit_receive(dev->dev, &reg, 1, raw, sizeof(raw), 100);
     if (err != ESP_OK) {
         return err;
     }

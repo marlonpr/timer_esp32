@@ -4,6 +4,7 @@
 #include "protocol_codec.h"
 
 #include <algorithm>
+#include <cstring>
 #include <cstdint>
 #include <iostream>
 #include <string_view>
@@ -189,7 +190,7 @@ void CheckProtocolFormats() {
         12345, 0, 0);
     CHECK(length > 0);
     CHECK(std::string_view(packet, static_cast<std::size_t>(length)) ==
-          "FCT2|STATUS|ESP03|0123456789ABCDEF|RUNNING|19|-57|6|AA:BB:CC:DD:EE:FF|LOCKED|129|0.785|0|1|-6.500001|2|25.25|1|7|-987654|7654321|7654000|-987333|0|0|28|49|0|3039|0|0|0|0|0|0|NONE|0|0|0|0|0|0|0|00000000");
+          "FCT2|STATUS|ESP03|0123456789ABCDEF|RUNNING|19|-57|6|AA:BB:CC:DD:EE:FF|LOCKED|129|0.785|0|1|-6.500001|2|25.25|1|7|-987654|7654321|7654000|-987333|0|0|28|49|0|3039|0|0|0|0|0|0|NONE|0|0|0|0|0|0|0|00000000|00");
 
     // The extended fleet-health STATUS must still fit inside the advertised
     // protocol envelope even at conservative numeric extremes.
@@ -202,11 +203,22 @@ void CheckProtocolFormats() {
         INT64_MIN, INT64_MIN, UINT32_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX,
         true, UINT32_MAX, UINT32_MAX, UINT32_MAX, "TASKNAME1234567",
         UINT32_MAX, UINT32_MAX, true, UINT32_MAX, UINT32_MAX, true,
-        UINT32_MAX, "deadbeef");
+        UINT32_MAX, "deadbeef", 0xFF);
     CHECK(length > 0);
-    CHECK(static_cast<std::size_t>(length) <= factory_timer::kMaxPacketLength);
+    CHECK(static_cast<std::size_t>(length) == factory_timer::kMaxPacketLength);
+    CHECK(std::strlen(packet) == static_cast<std::size_t>(length));
+    CHECK(std::count(packet, packet + length, '|') == 44);
+    CHECK(std::string_view(packet + length - 3) == "|FF");
+    std::cout << "STATUS_MAX_WIDTH_PACKET=" << packet << '\n';
     std::cout << "STATUS_MAX_WIDTH_BYTES=" << length
               << " STATUS_PLUS_SIX_HEX_COUNTERS_BYTES=" << length + 6 * 9 << '\n';
+    for (const bool negative_local_epoch : {false, true}) {
+        CHECK(factory_timer::FormatStatus(
+            packet, sizeof(packet), "ESP01", 1, factory_timer::TimerState::Ready,
+            0, -57, 6, "AA:BB:CC:DD:EE:FF", "LOCKED", 129, 0.5, 0,
+            true, 0, 0, 25, 1, 7, 0, negative_local_epoch ? -1 : 0,
+            negative_local_epoch ? 0 : -1, 0, 0, 0, 0, 0, 0, 0, 0, 0) == -1);
+    }
     // The new counters/windows are deliberately separate from STATUS.
     factory_timer::RunDiagnosticFields diagnostic{};
     diagnostic.valid = true;

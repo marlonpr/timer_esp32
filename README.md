@@ -1,4 +1,23 @@
-# Factory timer firmware 6.23.18
+# Factory timer firmware 6.23.19
+
+6.23.19 appends `DiagnosticFlags` to STATUS (field 44, a two-digit hex byte).
+It is computed from build options at compile time and logged once at boot;
+`HealthFlags` retains its runtime meaning. Production fleet profiles report
+`DiagnosticFlags=0x00`; the 500 us START test reports `0x04`. Task/ISR canaries,
+timing-probe/cache/offset diagnostics and classic-ESP32 monitor-off profiles
+are also explicitly identified. Observation-only COMMIT/refresh marker GPIOs
+remain usable in qualification with zero flags.
+
+STATUS now has 45 fields. Only in this layout, `RtcQueueDrops` (index 12) uses
+hex instead of decimal, saving two maximum-width bytes. The maximum valid-width
+packet, including `FF` reserved diagnostic bits, is exactly 511 bytes; no counter
+is clipped. The formatter rejects negative synchronization epochs, matching the
+existing controller wire contract. RUN_DIAG is unchanged at 21 fields / 243 bytes.
+Update controller to 6.22.15 along with firmware; its preparation and final
+STATUS gates reject nonzero or absent flags. The included diagnostic profiles
+remain available, but cannot be started by the qualification controller.
+
+## 6.23.18
 
 6.23.18 caches both task inventories during CommandTask startup, after all
 application and Wi-Fi tasks exist and before the UDP command socket opens.

@@ -1,2 +1,2 @@
-v6.23.18 — boot-cached display/monitor task inventories; optional 500 us late-START epoch regression
+v6.23.19 — compile-time DiagnosticFlags STATUS byte; boot-cached inventories and frozen T* retained
 (folder name kept as firmware_v6_23_16 so bundle paths stay stable)

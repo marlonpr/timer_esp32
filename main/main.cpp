@@ -8,6 +8,7 @@
 #include "ds3231.h"
 #include "rtc_discipline.h"
 #include "start_task_test_delay.h"
+#include "diagnostic_flags.h"
 
 #include <atomic>
 #include <cerrno>
@@ -914,7 +915,7 @@ void SendStatus(int socket_fd, const sockaddr_in &peer,
         cpu0_overflow_total,
         cpu0_interrupt_level_match,
         display_health.cpu0_monitor_missed_periods,
-        FirmwareElfSha8());
+        FirmwareElfSha8(), factory_timer::BuildDiagnosticFlags());
     if (timing != nullptr) timing->format_done_us = esp_timer_get_time();
     SendPacket(socket_fd, peer, packet, length, "STATUS",
                timing != nullptr ? &timing->sendto_entry_us : nullptr,
@@ -2363,6 +2364,7 @@ extern "C" void app_main() {
     }
     ESP_LOGI(kTag, "Factory countdown timer starting");
     ESP_LOGI(kTag, "Configured device identity: %s", CONFIG_FACTORY_DEVICE_ID);
+    ESP_LOGI(kTag, "DiagnosticFlags=0x%02X", static_cast<unsigned>(factory_timer::BuildDiagnosticFlags()));
 #if defined(CONFIG_FACTORY_START_TASK_TEST_DELAY_US) && CONFIG_FACTORY_START_TASK_TEST_DELAY_US > 0
     ESP_LOGW(kTag, "START_TASK_DELAY_TEST enabled delay_us=%u diagnostic_only=1",
              static_cast<unsigned>(CONFIG_FACTORY_START_TASK_TEST_DELAY_US));

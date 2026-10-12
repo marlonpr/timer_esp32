@@ -386,10 +386,11 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
                  uint32_t cpu0_monitor_overflow,
                  bool cpu0_interrupt_level_match,
                  uint32_t cpu0_monitor_missed_periods,
-                 std::string_view firmware_elf_sha8) {
+                 std::string_view firmware_elf_sha8, uint8_t diagnostic_flags) {
     if (destination == nullptr || capacity == 0 || !ValidDeviceId(device_id) ||
         remaining_seconds > kMaxDurationSeconds || rssi_dbm < -127 || rssi_dbm > 0 ||
         rtc_sqw_core < -1 || rtc_sqw_core > 1 ||
+        sync_epoch_local_us < 0 || sync_epoch_disciplined_us < 0 ||
         bssid.size() != 17 || rtc_discipline_state.empty() ||
         rtc_discipline_state.size() > 16 || !std::isfinite(rtc_fit_rms_us) ||
         rtc_fit_rms_us < 0.0 || rtc_fit_rms_us > 1000000.0 ||
@@ -406,7 +407,7 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
         if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return -1;
     }
     return std::snprintf(destination, capacity,
-                         "FCT2|STATUS|%.*s|%016llX|%s|%u|%d|%u|%.*s|%.*s|%u|%.3f|%u|%u|%.6f|%llX|%.2f|%d|%u|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%u|%llX|%llX|%llX|%u|%X|%X|%X|%.*s|%X|%X|%u|%X|%X|%u|%X|%.*s",
+                         "FCT2|STATUS|%.*s|%016llX|%s|%u|%d|%u|%.*s|%.*s|%u|%.3f|%X|%u|%.6f|%llX|%.2f|%d|%u|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%u|%llX|%llX|%llX|%u|%X|%X|%X|%.*s|%X|%X|%u|%X|%X|%u|%X|%.*s|%02X",
                          static_cast<int>(device_id.size()), device_id.data(),
                          static_cast<unsigned long long>(command_id), TimerStateName(state),
                          static_cast<unsigned>(remaining_seconds), rssi_dbm,
@@ -444,7 +445,7 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
                          cpu0_interrupt_level_match ? 1u : 0u,
                          static_cast<unsigned>(cpu0_monitor_missed_periods),
                          static_cast<int>(firmware_elf_sha8.size()),
-                         firmware_elf_sha8.data());
+                         firmware_elf_sha8.data(), static_cast<unsigned>(diagnostic_flags));
 }
 
 int FormatRunDiagnostic(char* destination, std::size_t capacity,

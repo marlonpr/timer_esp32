@@ -106,7 +106,8 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
                  uint32_t cpu0_monitor_overflow = 0,
                  bool cpu0_interrupt_level_match = false,
                  uint32_t cpu0_monitor_missed_periods = 0,
-                 std::string_view firmware_elf_sha8 = "00000000");
+                 std::string_view firmware_elf_sha8 = "00000000",
+                 uint8_t diagnostic_flags = 0);
 struct RunDiagnosticFields {
     bool valid{};
     uint32_t period_us{};

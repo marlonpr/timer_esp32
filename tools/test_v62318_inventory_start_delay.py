@@ -18,7 +18,7 @@ monitor = (ROOT/'components/factory_display/cpu0_latency_monitor.cpp').read_text
 run_prep = monitor.split('void cpu0_latency_monitor_prepare_run(',1)[1].split('void cpu0_latency_monitor_begin_run(',1)[0]
 assert 'RefreshTaskInventory();' not in run_prep
 assert 'now = factory_timer::InjectStartTaskTestDelay();' in main
-assert 'set(PROJECT_VER "6.23.18")' in (ROOT/'CMakeLists.txt').read_text()
+assert 'set(PROJECT_VER "6.23.19")' in (ROOT/'CMakeLists.txt').read_text()
 for n in range(1,16):
     normal = (ROOT/f'sdkconfig.esp{n:02d}').read_text()
     assert re.search(r'^CONFIG_FACTORY_START_TASK_TEST_DELAY_US=0$',normal,re.M)

@@ -1,2 +1,4 @@
-v6.23.19 — compile-time DiagnosticFlags STATUS byte; boot-cached inventories and frozen T* retained
-(folder name kept as firmware_v6_23_16 so bundle paths stay stable)
+v6.24.0 — segmented repetitions; one frozen disciplined T*; recovery-aware production gates
+Reference: firmware v6.23.19 / controller v6.22.18 (preserved separately).
+Folder names remain unchanged for existing build paths.
+RELEASE_CANDIDATE: target/.NET builds and physical production validation pending.

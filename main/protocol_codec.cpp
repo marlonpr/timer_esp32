@@ -1,4 +1,7 @@
 #include "protocol_codec.h"
+#include "countdown_timer.h"
+#include "segment_schedule.h"
+#include <string>
 
 #include <cmath>
 
@@ -75,8 +78,32 @@ bool ValidateEnvelope(std::string_view packet, ParseError& error) {
 bool ParseCommandFields(std::string_view packet, CommandPacket& output, ParseError& error) {
     std::array<std::string_view, 6> fields{};
     if (!SplitExact(packet, fields)) {
-        error = ParseError::FieldCount;
-        return false;
+        std::array<std::string_view, 13> segment{};
+        if (!SplitExact(packet, segment) || segment[0] != kVersion2 ||
+            segment[1] != "CMD" || segment[2] != "START_AT") {
+            error = ParseError::FieldCount;
+            return false;
+        }
+        // Reuse the legacy six-field validation without admitting extra fields.
+        const std::string base = std::string(segment[0]) + "|" + std::string(segment[1]) + "|" +
+            std::string(segment[2]) + "|" + std::string(segment[3]) + "|" +
+            std::string(segment[4]) + "|" + std::string(segment[5]);
+        CommandPacket parsed{};
+        if (!ParseCommandFields(base, parsed, error)) return false;
+        if (!ParseCommandId(segment[6], parsed.plan_id) ||
+            !ParseDecimal(segment[7], parsed.segment_index) ||
+            !ParseDecimal(segment[8], parsed.repeat_count) ||
+            !ParseDecimal(segment[9], parsed.first_repeat) ||
+            !ParseDecimal(segment[10], parsed.total_repeats) ||
+            !ParseCommandId(segment[11], parsed.expected_boot_id) ||
+            !(segment[12] == "0000000000000000" || ParseCommandId(segment[12], parsed.expected_previous_command_id)) ||
+            !ValidSegment(parsed.duration_seconds, parsed.repeat_count, parsed.first_repeat,
+                          parsed.total_repeats, parsed.segment_index)) {
+            error = ParseError::Duration;
+            return false;
+        }
+        output = parsed;
+        return true;
     }
     if (fields[0] != kVersion1 && fields[0] != kVersion2) {
         error = ParseError::Version;
@@ -351,6 +378,8 @@ int FormatAck(char* destination, std::size_t capacity, std::string_view device_i
         case AckResult::Duplicate: result_text = "DUPLICATE"; break;
         case AckResult::NotSynced: result_text = "NOT_SYNCED"; break;
         case AckResult::Late: result_text = "LATE"; break;
+        case AckResult::Busy: result_text = "BUSY"; break;
+        case AckResult::Invalid: result_text = "INVALID"; break;
     }
     return std::snprintf(destination, capacity, "FCT1|ACK|%.*s|%016llX|%s|%s",
                          static_cast<int>(device_id.size()), device_id.data(),
@@ -467,16 +496,45 @@ int FormatRunDiagnostic(char* destination, std::size_t capacity,
         static_cast<unsigned>(f.rearm_failures));
 }
 
+int FormatExecutionStatus(char* destination, std::size_t capacity,
+                          std::string_view device_id, uint64_t response_id,
+                          uint64_t boot_id, const TimerSnapshot& s,
+                          int64_t tstar_local_us, uint16_t rtc_recovered_edges, int64_t phase_us) {
+    if (destination == nullptr || capacity == 0 || !ValidDeviceId(device_id) || boot_id == 0) return -1;
+    return std::snprintf(destination, capacity,
+        "FCT2|EXEC_STATUS|%.*s|%016llX|%016llX|%016llX|%u|%016llX|%s|%u|%u|%u|%u|%u|%u|%lld|%lld|%u|%lld",
+        static_cast<int>(device_id.size()), device_id.data(),
+        static_cast<unsigned long long>(response_id), static_cast<unsigned long long>(boot_id),
+        static_cast<unsigned long long>(s.plan_id), static_cast<unsigned>(s.segment_index),
+        static_cast<unsigned long long>(s.last_command_id), TimerStateName(s.state),
+        static_cast<unsigned>(s.duration_seconds), static_cast<unsigned>(s.repeat_count),
+        static_cast<unsigned>(s.first_repeat), static_cast<unsigned>(s.total_repeats),
+        static_cast<unsigned>(s.current_repeat), static_cast<unsigned>(s.elapsed_segment_seconds),
+        static_cast<long long>(s.target_master_us), static_cast<long long>(tstar_local_us),
+        static_cast<unsigned>(rtc_recovered_edges), static_cast<long long>(phase_us));
+}
+
 int FormatSyncReply(char* destination, std::size_t capacity, std::string_view device_id,
                     uint64_t sync_id, int64_t master_t1_us,
                     int64_t local_t2_us, int64_t local_t3_us,
                     int64_t ingress_local_us,
                     uint32_t actual_artificial_reply_delay_us,
                     bool has_die_temperature,
-                    int32_t die_temperature_milli_c) {
+                    int32_t die_temperature_milli_c, std::string_view bssid) {
     if (destination == nullptr || capacity == 0 || !ValidDeviceId(device_id) ||
         sync_id == 0 || ingress_local_us < 0) return -1;
 
+    if (!bssid.empty()) {
+        if (bssid.size() != 17) return -1;
+        return std::snprintf(destination, capacity,
+            "FCT2|SYNC_REPLY|%.*s|%016llX|%lld|%lld|%lld|%u|%lld|%ld|%.*s",
+            static_cast<int>(device_id.size()), device_id.data(),
+            static_cast<unsigned long long>(sync_id), static_cast<long long>(master_t1_us),
+            static_cast<long long>(local_t2_us), static_cast<long long>(local_t3_us),
+            static_cast<unsigned>(actual_artificial_reply_delay_us), static_cast<long long>(ingress_local_us),
+            static_cast<long>(has_die_temperature ? die_temperature_milli_c : 0),
+            static_cast<int>(bssid.size()), bssid.data());
+    }
     // v6.22 extends SYNC_REPLY with the earliest matched device ingress timestamp.
     // Classic ESP32 form: ...|T3|actual_reverse_hold_us|ingress_local_us
     // S3 diagnostic form appends die temperature after ingress.

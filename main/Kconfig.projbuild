@@ -12,6 +12,17 @@ config FACTORY_WIFI_PASSWORD
     help
         WPA/WPA2/WPA3 password. Leave empty only for an open test network.
 
+config FACTORY_WIFI_BSSID_LOCK
+    bool "Lock station to an installation BSSID"
+    default n
+    help
+        Optional installation policy. Automatic AP selection remains the default.
+
+config FACTORY_WIFI_BSSID
+    string "Installation AP BSSID (XX:XX:XX:XX:XX:XX)"
+    depends on FACTORY_WIFI_BSSID_LOCK
+    default ""
+
 config FACTORY_DEVICE_ID
     string "Timer device ID"
     default "ESP01"

@@ -13,10 +13,21 @@ struct TimerSnapshot {
     uint32_t remaining_seconds;
     uint32_t duration_seconds;
     uint64_t last_command_id;
+    uint64_t plan_id{};
+    uint32_t segment_index{};
+    uint32_t repeat_count{1};
+    uint32_t first_repeat{1};
+    uint32_t total_repeats{1};
+    uint32_t current_repeat{1};
+    uint32_t elapsed_segment_seconds{};
+    int64_t target_master_us{};
+    int64_t elapsed_segment_microseconds{};
+    uint32_t SegmentDurationSeconds() const { return duration_seconds * repeat_count; }
 
     bool operator==(const TimerSnapshot& other) const {
         return state == other.state && remaining_seconds == other.remaining_seconds &&
-               duration_seconds == other.duration_seconds && last_command_id == other.last_command_id;
+               duration_seconds == other.duration_seconds && last_command_id == other.last_command_id &&
+               current_repeat == other.current_repeat && elapsed_segment_seconds == other.elapsed_segment_seconds;
     }
     bool operator!=(const TimerSnapshot& other) const { return !(*this == other); }
 };
@@ -39,7 +50,9 @@ public:
                          int64_t now_running_microseconds);
 
     TimerSnapshot Snapshot() const;
+    void SetScheduledRunningMicroseconds(int64_t target) { scheduled_running_microseconds_ = target; }
     int64_t ScheduledStartMicroseconds() const { return scheduled_start_microseconds_; }
+    int64_t ScheduledRunningMicroseconds() const { return scheduled_running_microseconds_; }
     int64_t StartRunningMicroseconds() const { return start_running_microseconds_; }
     int64_t EndRunningMicroseconds() const { return end_running_microseconds_; }
 
@@ -57,6 +70,14 @@ private:
     int64_t scheduled_start_microseconds_{};
     int64_t start_running_microseconds_{};
     int64_t end_running_microseconds_{};
+    int64_t scheduled_running_microseconds_{};
+    CommandPacket segment_{};
+    std::array<CommandPacket, kRecentCommandCount> recent_commands_{};
+    uint32_t elapsed_segment_seconds_{};
+    int64_t elapsed_segment_microseconds_{};
+    bool cancelled_before_start_{};
+    uint64_t last_plan_id_{};
+    uint32_t last_segment_index_{};
 };
 
 }  // namespace factory_timer

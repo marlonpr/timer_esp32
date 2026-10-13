@@ -1,3 +1,10 @@
+# Firmware 6.24.0 — segmented repetition release candidate
+
+See [the production implementation and validation notes](../SEGMENTED_REPETITIONS.md).
+This extends the existing RTC scheduler; the 6.23.19 baseline is preserved.
+Target compilation and physical fleet validation are required before deployment.
+The historical build/preflight notes below remain useful for the unchanged paths.
+
 # Factory timer firmware 6.23.19
 
 6.23.19 appends `DiagnosticFlags` to STATUS (field 44, a two-digit hex byte).

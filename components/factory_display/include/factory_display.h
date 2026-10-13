@@ -24,6 +24,9 @@ void factory_display_begin_run_monitor(uint64_t command_id, int64_t local_start_
 
 // The immutable disciplined T* and its initial raw-local deadline come from ARM.
 // Every scheduled boundary, including 0, uses T* + n * 1000000 us.
+void factory_display_arm_segment(int64_t local_start_us, int64_t start_disciplined_us,
+                                 uint32_t duration_seconds, uint32_t repeat_count,
+                                 uint64_t command_id);
 void factory_display_arm(int64_t local_start_us, int64_t start_disciplined_us,
                          uint32_t duration_seconds, uint64_t command_id);
 

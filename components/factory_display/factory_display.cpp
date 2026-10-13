@@ -1,4 +1,5 @@
 #include "factory_display.h"
+#include "../../main/segment_schedule.h"
 #include "display_backend.h"
 #include "cpu0_latency_monitor.h"
 #include "logo_bitmap.h"
@@ -91,6 +92,7 @@ struct DisplayCommand {
     int64_t start_disciplined_us{};
     uint32_t duration_seconds{};
     uint64_t command_id{};
+    uint32_t repeat_count{1};
 };
 
 struct BoundaryTraceRecord {
@@ -1365,8 +1367,8 @@ void DisplayTask(void*) {
 #endif
 
 #if CONFIG_IDF_TARGET_ESP32
-        for (uint32_t elapsed = 1; elapsed <= command.duration_seconds; ++elapsed) {
-            const uint32_t remaining = command.duration_seconds - elapsed;
+        for (uint32_t elapsed = 1; elapsed <= factory_timer::SegmentSeconds(command.duration_seconds, command.repeat_count); ++elapsed) {
+            const uint32_t remaining = factory_timer::RepeatRemaining(command.duration_seconds, command.repeat_count, elapsed);
             if (remaining == 0) {
                 RenderFinishedToBackBuffer();
             } else {
@@ -1447,8 +1449,8 @@ void DisplayTask(void*) {
             s_prepared_sequence.store(0, std::memory_order_release);
         }
 #else
-        for (uint32_t elapsed = 1; elapsed <= command.duration_seconds; ++elapsed) {
-            const uint32_t remaining = command.duration_seconds - elapsed;
+        for (uint32_t elapsed = 1; elapsed <= factory_timer::SegmentSeconds(command.duration_seconds, command.repeat_count); ++elapsed) {
+            const uint32_t remaining = factory_timer::RepeatRemaining(command.duration_seconds, command.repeat_count, elapsed);
             if (remaining == 0) {
                 RenderFinishedToBackBuffer();
             } else {
@@ -1673,8 +1675,15 @@ extern "C" void factory_display_arm(int64_t local_start_us,
                                       int64_t start_disciplined_us,
                                       uint32_t duration_seconds,
                                       uint64_t command_id) {
-    if (!s_ready.load() || s_command_queue == nullptr) return;
+    factory_display_arm_segment(local_start_us, start_disciplined_us, duration_seconds, 1, command_id);
+}
+
+extern "C" void factory_display_arm_segment(int64_t local_start_us, int64_t start_disciplined_us,
+                                              uint32_t duration_seconds, uint32_t repeat_count,
+                                              uint64_t command_id) {
+    if (!s_ready.load() || s_command_queue == nullptr || repeat_count == 0) return;
     DisplayCommand command{};
+    command.repeat_count = repeat_count;
     command.type = DisplayCommand::Type::Arm;
     command.local_start_us = local_start_us;
     command.start_disciplined_us = start_disciplined_us;

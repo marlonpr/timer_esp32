@@ -114,7 +114,11 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
                  bool cpu0_interrupt_level_match = false,
                  uint32_t cpu0_monitor_missed_periods = 0,
                  std::string_view firmware_elf_sha8 = "00000000",
-                 uint8_t diagnostic_flags = 0);
+                 uint8_t diagnostic_flags = 0,
+                 bool wifi_telemetry_valid = false,
+                 uint32_t wifi_disconnect_count = 0,
+                 uint32_t wifi_reconnect_count = 0,
+                 uint64_t wifi_last_reconnect_uptime_ms = 0);
 struct RunDiagnosticFields {
     bool valid{};
     uint32_t period_us{};

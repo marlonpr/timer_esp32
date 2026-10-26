@@ -2,9 +2,22 @@ menu "Factory timer configuration"
 
 config FACTORY_WIFI_SSID
     string "Wi-Fi SSID"
-    default ""
+    default "FT-ZONE1"
     help
-        SSID used by this timer in Wi-Fi station mode.
+        Home-zone SSID used by this timer. The supplied ESP01-ESP15 profiles
+        assign five timers to each of FT-ZONE1, FT-ZONE2 and FT-ZONE3.
+        Only this SSID is searched; there is no cross-zone SSID fallback.
+
+config FACTORY_WIFI_IDLE_ROAM
+    bool "Optional idle roaming between APs sharing the configured SSID"
+    default n
+    help
+        Disabled for the default three-zone deployment. Enable only for the
+        optional shared-SSID deployment. While idle, reassess weak links below
+        -70 dBm and switch only to a matching AP at least 10 dB stronger.
+        No deliberate roaming occurs while ARMED or RUNNING. Reconnect
+        backoff and initial strongest-signal selection remain enabled in
+        either mode. This never searches other zone SSIDs.
 
 config FACTORY_WIFI_PASSWORD
     string "Wi-Fi password"
@@ -16,7 +29,8 @@ config FACTORY_WIFI_BSSID_LOCK
     bool "Lock station to an installation BSSID"
     default n
     help
-        Optional installation policy. Automatic AP selection remains the default.
+        Optional installation policy. Otherwise select the strongest AP
+        matching this timer's configured SSID.
 
 config FACTORY_WIFI_BSSID
     string "Installation AP BSSID (XX:XX:XX:XX:XX:XX)"

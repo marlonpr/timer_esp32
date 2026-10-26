@@ -16,6 +16,8 @@ extern "C" {
 #define DS3231_I2C_PORT I2C_NUM_0
 #define DS3231_I2C_ADDR 0x68
 #define DS3231_I2C_SPEED_HZ 100000
+/* Bound each probe/transaction, including the register operations at boot. */
+#define DS3231_I2C_TIMEOUT_MS 100
 
 typedef struct {
     uint16_t year;
@@ -32,7 +34,7 @@ typedef struct {
     i2c_master_dev_handle_t dev;
 } ds3231_dev_t;
 
-/** Initialize DS3231 on GPIO21/GPIO22 using ESP-IDF i2c_master API. */
+/** Initialize and probe address 0x68 on GPIO21/GPIO22; return on timeout/NACK. */
 esp_err_t init_ds3231(ds3231_dev_t *out_dev);
 
 /** Existing calendar helpers retained for compatibility. */

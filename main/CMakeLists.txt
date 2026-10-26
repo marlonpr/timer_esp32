@@ -10,6 +10,7 @@ idf_component_register(
         "countdown_timer.cpp"
         "protocol_codec.cpp"
         "network_policy.cpp"
+        "wifi_maintenance.cpp"
         "flash_guard_diag.cpp"
     INCLUDE_DIRS "."
     REQUIRES driver esp_app_format esp_event esp_netif esp_timer esp_wifi nvs_flash spi_flash lwip factory_display rtc_discipline ${FACTORY_TIMER_EXTRA_REQUIRES}

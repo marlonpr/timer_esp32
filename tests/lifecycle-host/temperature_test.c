@@ -9,6 +9,17 @@ static esp_err_t read_result=ESP_OK;
 esp_err_t ds3231_get_temperature_c(ds3231_dev_t* dev,float* out) {
     (void)dev;++reads;host_now_us+=110;*out=26.25f;return read_result;
 }
+// This temperature-only host harness stubs the unrelated RTC startup/OSF
+// functions. The actual DS3231 driver has a separate startup-host test.
+esp_err_t ds3231_configure_1hz_sqw(ds3231_dev_t* dev) {
+    (void)dev; return ESP_OK;
+}
+esp_err_t ds3231_get_oscillator_stop_flag(ds3231_dev_t* dev, bool* is_set) {
+    (void)dev; *is_set = false; return ESP_OK;
+}
+esp_err_t ds3231_clear_oscillator_stop_flag(ds3231_dev_t* dev) {
+    (void)dev; return ESP_OK;
+}
 int main(void) {
     ds3231_dev_t rtc={0};s_ctx.rtc=&rtc;s_ctx.initialized=true;
     s_ctx.temperature_mutex=xSemaphoreCreateMutex();

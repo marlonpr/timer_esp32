@@ -4,6 +4,7 @@
 #include "cpu0_latency_monitor.h"
 #include "flash_guard_diag.h"
 #include "network_policy.h"
+#include "wifi_maintenance.h"
 #include "protocol_codec.h"
 #include "ds3231.h"
 #include "rtc_discipline.h"
@@ -131,6 +132,13 @@ esp_netif_t *wifi_sta_netif = nullptr;
 TaskHandle_t dhcp_retry_task_handle = nullptr;
 std::atomic<bool> dhcp_retry_pending{false};
 std::atomic<uint32_t> rejected_network_count{0};
+std::atomic<uint32_t> wifi_link_generation{0};
+// Boot-local radio telemetry. No flash writes or waits in the Wi-Fi callback.
+std::atomic<uint32_t> wifi_disconnect_count{0};
+std::atomic<uint32_t> wifi_reconnect_count{0};
+std::atomic<uint64_t> wifi_last_reconnect_uptime_ms{0};
+std::atomic<bool> wifi_had_accepted_lease{false};
+std::atomic<bool> wifi_reconnect_pending{false};
 std::atomic<uint32_t> running_heartbeat_suppressed{0};
 factory_timer::CountdownTimer countdown;
 SemaphoreHandle_t countdown_mutex = nullptr;
@@ -425,6 +433,17 @@ bool IsAcceptedIpInfo(const esp_netif_ip_info_t &info) {
         ntohl(info.ip.addr), ntohl(info.netmask.addr), ntohl(info.gw.addr));
 }
 
+bool WifiSegmentActive() {
+    xSemaphoreTake(countdown_mutex, portMAX_DELAY);
+    const auto state = countdown.Snapshot().state;
+    xSemaphoreGive(countdown_mutex);
+    return state == factory_timer::TimerState::Armed || state == factory_timer::TimerState::Running;
+}
+
+void InvalidateWifiSynchronization() {
+    clock_sync.valid.store(false, std::memory_order_release);
+}
+
 void RequestDhcpRetry() {
     if (dhcp_retry_task_handle == nullptr) return;
     if (!dhcp_retry_pending.exchange(true)) {
@@ -482,6 +501,7 @@ void InitialiseRtcDiscipline() {
         ESP_LOGE(kTag,
                  "DS3231 initialization failed (%s); disciplined timing is unavailable",
                  esp_err_to_name(result));
+        ESP_LOGW(kTag, "Continuing display/network startup; RTC-dependent START remains blocked");
         return;
     }
 
@@ -498,6 +518,7 @@ void InitialiseRtcDiscipline() {
         ESP_LOGE(kTag,
                  "DS3231 discipline initialization failed (%s); disciplined timing is unavailable",
                  esp_err_to_name(result));
+        ESP_LOGW(kTag, "Continuing display/network startup; RTC-dependent START remains blocked");
         return;
     }
 
@@ -573,16 +594,24 @@ void WifiEventHandler(void *, esp_event_base_t event_base, int32_t event_id,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         ESP_LOGI(kTag, "Wi-Fi station started; connecting to SSID '%s'",
                  CONFIG_FACTORY_WIFI_SSID);
-        ESP_ERROR_CHECK(esp_wifi_connect());
+        factory_timer::WifiStationStarted();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        factory_timer::WifiStationConnected();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
+        const auto* event = static_cast<wifi_event_sta_scan_done_t*>(event_data);
+        factory_timer::WifiScanCompleted(event->status);
     } else if (event_base == WIFI_EVENT &&
                event_id == WIFI_EVENT_STA_DISCONNECTED) {
         const auto *event = static_cast<wifi_event_sta_disconnected_t *>(event_data);
+        wifi_disconnect_count.fetch_add(1, std::memory_order_relaxed);
+        if (wifi_had_accepted_lease.load(std::memory_order_relaxed))
+            wifi_reconnect_pending.store(true, std::memory_order_relaxed);
         xEventGroupClearBits(wifi_event_group, kWifiConnectedBit);
         clock_sync.valid.store(false, std::memory_order_release);
         ESP_LOGW(kTag,
                  "Wi-Fi disconnected: reason=%u; clock synchronization invalidated; reconnecting",
                  static_cast<unsigned>(event->reason));
-        esp_wifi_connect();
+        factory_timer::WifiStationDisconnected();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         const auto *event = static_cast<ip_event_got_ip_t *>(event_data);
 
@@ -605,6 +634,15 @@ void WifiEventHandler(void *, esp_event_base_t event_base, int32_t event_id,
         ESP_LOGI(kTag, "Accepted factory LAN: ip=" IPSTR " mask=" IPSTR " gw=" IPSTR,
                  IP2STR(&event->ip_info.ip), IP2STR(&event->ip_info.netmask),
                  IP2STR(&event->ip_info.gw));
+        factory_timer::WifiFactoryLinkReady();
+        if (wifi_reconnect_pending.exchange(false, std::memory_order_relaxed)) {
+            wifi_reconnect_count.fetch_add(1, std::memory_order_relaxed);
+            wifi_last_reconnect_uptime_ms.store(
+                static_cast<uint64_t>(esp_timer_get_time() / 1000),
+                std::memory_order_relaxed);
+        }
+        wifi_had_accepted_lease.store(true, std::memory_order_relaxed);
+        wifi_link_generation.fetch_add(1, std::memory_order_release);
         xEventGroupSetBits(wifi_event_group, kWifiConnectedBit);
     }
 }
@@ -654,6 +692,10 @@ void InitialiseWifi() {
     wifi_config.sta.threshold.authmode =
         std::strlen(CONFIG_FACTORY_WIFI_PASSWORD) == 0 ? WIFI_AUTH_OPEN
                                                        : WIFI_AUTH_WPA2_PSK;
+    // Consider every matching AP before choosing one; a fast scan can stop at
+    // the first matching SSID on an earlier channel in a multi-AP installation.
+    wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     wifi_config.sta.pmf_cfg.capable = true;
     wifi_config.sta.pmf_cfg.required = false;
 #if defined(CONFIG_FACTORY_WIFI_BSSID_LOCK) && CONFIG_FACTORY_WIFI_BSSID_LOCK
@@ -667,9 +709,18 @@ void InitialiseWifi() {
 #endif
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    // Roaming uses temporary BSSID pins; reconnects must never write them to NVS.
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(factory_timer::WifiMaintenanceInit({WifiSegmentActive, InvalidateWifiSynchronization}));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_LOGI(kTag, "Wi-Fi AP selection: all-channel scan, strongest matching signal");
+#if defined(CONFIG_FACTORY_WIFI_IDLE_ROAM) && CONFIG_FACTORY_WIFI_IDLE_ROAM
+    ESP_LOGI(kTag, "Optional shared-SSID idle roaming enabled; never while ARMED/RUNNING");
+#else
+    ESP_LOGI(kTag, "Idle roaming disabled (zone default); configured SSID only, reconnect backoff enabled");
+#endif
     ESP_LOGI(kTag, "Wi-Fi power saving disabled for lower timing jitter");
 }
 
@@ -943,7 +994,10 @@ void SendStatus(int socket_fd, const sockaddr_in &peer,
         cpu0_overflow_total,
         cpu0_interrupt_level_match,
         display_health.cpu0_monitor_missed_periods,
-        FirmwareElfSha8(), factory_timer::BuildDiagnosticFlags());
+        FirmwareElfSha8(), factory_timer::BuildDiagnosticFlags(),
+        true, wifi_disconnect_count.load(std::memory_order_relaxed),
+        wifi_reconnect_count.load(std::memory_order_relaxed),
+        wifi_last_reconnect_uptime_ms.load(std::memory_order_relaxed));
     if (timing != nullptr) timing->format_done_us = esp_timer_get_time();
     SendPacket(socket_fd, peer, packet, length, "STATUS",
                timing != nullptr ? &timing->sendto_entry_us : nullptr,
@@ -1821,6 +1875,17 @@ void LogAcceptedCommand(const factory_timer::CommandPacket &command,
     }
 }
 
+bool RefreshCommandSocketForLink(int& socket_fd, uint32_t& socket_generation, uint32_t link_generation) {
+    if (socket_fd >= 0 && socket_generation == link_generation) return true;
+    if (socket_fd >= 0) close(socket_fd);
+    socket_fd = CreateCommandSocket();
+    if (socket_fd < 0) return false;
+    socket_generation = link_generation;
+    ESP_LOGI(kTag, "UDP command socket renewed after Wi-Fi link change: generation=%u",
+             static_cast<unsigned>(link_generation));
+    return true;
+}
+
 void CommandTask(void *) {
     xEventGroupWaitBits(wifi_event_group, kWifiConnectedBit, pdFALSE, pdTRUE,
                         portMAX_DELAY);
@@ -1829,11 +1894,10 @@ void CommandTask(void *) {
     // scans before opening the socket, so START_AT cannot overlap an inventory.
     factory_display_cache_runtime_inventory();
 #endif
-    const int socket_fd = CreateCommandSocket();
+    uint32_t socket_link_generation = wifi_link_generation.load(std::memory_order_acquire);
+    int socket_fd = CreateCommandSocket();
     if (socket_fd < 0) {
-        ESP_LOGE(kTag, "UDP task stopping because the socket could not be created");
-        vTaskDelete(nullptr);
-        return;
+        ESP_LOGW(kTag, "UDP socket creation failed; command task will retry");
     }
 
     sockaddr_in last_peer{};
@@ -1844,12 +1908,28 @@ void CommandTask(void *) {
     int64_t last_heartbeat = 0;
 
     while (true) {
+        // Keep the model's logical deadline current independently of Wi-Fi.  In
+        // particular, the very first STATUS after reconnect must not see a
+        // RUNNING snapshot frozen at the time of disconnection. The high-
+        // resolution display/START ISR remains the sole visible time source.
+        const int64_t pre_receive_us = esp_timer_get_time();
+        const int64_t pre_receive_disciplined_us =
+            rtc_discipline_local_to_disciplined_us(pre_receive_us);
+        xSemaphoreTake(countdown_mutex, portMAX_DELAY);
+        if (countdown.Snapshot().state != factory_timer::TimerState::Armed) {
+            (void)countdown.Update(pre_receive_us, pre_receive_disciplined_us);
+        }
+        xSemaphoreGive(countdown_mutex);
+
+        bool network_ready = false;
         if ((xEventGroupGetBits(wifi_event_group) & kWifiConnectedBit) == 0) {
             vTaskDelay(pdMS_TO_TICKS(20));
-            continue;
-        }
-
-        char buffer[factory_timer::kMaxPacketLength + 1]{};
+        } else if (!RefreshCommandSocketForLink(socket_fd, socket_link_generation,
+                       wifi_link_generation.load(std::memory_order_acquire))) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        } else {
+            network_ready = true;
+            char buffer[factory_timer::kMaxPacketLength + 1]{};
         sockaddr_in peer{};
         socklen_t peer_length = sizeof(peer);
         const int received = recvfrom(socket_fd, buffer, sizeof(buffer), 0,
@@ -1870,6 +1950,19 @@ void CommandTask(void *) {
                     ESP_LOGW(kTag, "Discarded invalid packet (%s)",
                              factory_timer::ParseErrorName(parse_error));
                 } else {
+                    const bool timing_control = packet.type != factory_timer::MasterPacketType::Command ||
+                        packet.command.type == factory_timer::CommandType::Start ||
+                        packet.command.type == factory_timer::CommandType::StartAt;
+                    const bool defer_roaming = timing_control ||
+                        packet.command.type == factory_timer::CommandType::Reset;
+                    factory_timer::WifiControlLease wifi_lease(receive_local_us, defer_roaming);
+                    if (timing_control && !wifi_lease.TimingReady()) {
+                        if (packet.type == factory_timer::MasterPacketType::Command)
+                            SendAck(socket_fd, peer, packet.command, factory_timer::AckResult::Busy);
+                        // Retry timing preparation after scan cancellation or handover.
+                        // STATUS and RESET remain available during an idle scan.
+                        continue;
+                    }
 #if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
                     StatusPathTraceRecord status_trace{};
                     const bool trace_status_path =
@@ -2203,7 +2296,9 @@ void CommandTask(void *) {
         } else if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
             ESP_LOGW(kTag, "UDP receive failed: errno=%d", errno);
         }
+        } // Only the UDP receive/command path depends on the network.
 
+        // Drain queued START telemetry and finish the countdown even offline.
         TimerStartEvent timer_event{};
         while (xQueueReceive(timer_event_queue, &timer_event, 0) == pdTRUE) {
             const int64_t deferred_log_us = esp_timer_get_time();
@@ -2261,13 +2356,13 @@ void CommandTask(void *) {
             }
 #endif
 
-            if (timer_event.have_peer && timer_event.target_master_start_us > 0) {
+            if (network_ready && timer_event.have_peer && timer_event.target_master_start_us > 0) {
                 SendStarted(socket_fd, timer_event.peer, timer_event.snapshot,
                             timer_event.actual_local_start_us,
                             timer_event.estimated_master_start_us,
                             timer_event.target_master_start_us);
             }
-            if (timer_event.have_peer) {
+            if (network_ready && timer_event.have_peer) {
 #if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
                 SendStatusWithTrace(socket_fd, timer_event.peer, timer_event.snapshot,
                                     StatusSendReason::TimerStarted);
@@ -2318,7 +2413,7 @@ void CommandTask(void *) {
                 RequestPostRunDiagnosticDump();
             }
             bool status_sent = false;
-            if (have_peer) {
+            if (network_ready && have_peer) {
                 bool send_state_change = true;
 #if !defined(CONFIG_FACTORY_PER_SECOND_STATE_CHANGE_STATUS) || !CONFIG_FACTORY_PER_SECOND_STATE_CHANGE_STATUS
                 if (snapshot.state == factory_timer::TimerState::Running &&
@@ -2355,7 +2450,7 @@ void CommandTask(void *) {
             if (status_sent || !have_peer) {
                 last_heartbeat = now;
             }
-        } else if (have_peer && now - last_heartbeat >= kHeartbeatIntervalUs) {
+        } else if (network_ready && have_peer && now - last_heartbeat >= kHeartbeatIntervalUs) {
             if (ShouldSuppressRunningHeartbeat(snapshot)) {
                 RecordSuppressedRunningHeartbeat();
             } else {

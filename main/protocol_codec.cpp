@@ -415,7 +415,9 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
                  uint32_t cpu0_monitor_overflow,
                  bool cpu0_interrupt_level_match,
                  uint32_t cpu0_monitor_missed_periods,
-                 std::string_view firmware_elf_sha8, uint8_t diagnostic_flags) {
+                 std::string_view firmware_elf_sha8, uint8_t diagnostic_flags,
+                 bool wifi_telemetry_valid, uint32_t wifi_disconnect_count,
+                 uint32_t wifi_reconnect_count, uint64_t wifi_last_reconnect_uptime_ms) {
     if (destination == nullptr || capacity == 0 || !ValidDeviceId(device_id) ||
         remaining_seconds > kMaxDurationSeconds || rssi_dbm < -127 || rssi_dbm > 0 ||
         rtc_sqw_core < -1 || rtc_sqw_core > 1 ||
@@ -435,7 +437,7 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
     for (char c : firmware_elf_sha8) {
         if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return -1;
     }
-    return std::snprintf(destination, capacity,
+    const int base_length = std::snprintf(destination, capacity,
                          "FCT2|STATUS|%.*s|%016llX|%s|%u|%d|%u|%.*s|%.*s|%u|%.3f|%X|%u|%.6f|%llX|%.2f|%d|%u|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%u|%llX|%llX|%llX|%u|%X|%X|%X|%.*s|%X|%X|%u|%X|%X|%u|%X|%.*s|%02X",
                          static_cast<int>(device_id.size()), device_id.data(),
                          static_cast<unsigned long long>(command_id), TimerStateName(state),
@@ -475,6 +477,24 @@ int FormatStatus(char* destination, std::size_t capacity, std::string_view devic
                          static_cast<unsigned>(cpu0_monitor_missed_periods),
                          static_cast<int>(firmware_elf_sha8.size()),
                          firmware_elf_sha8.data(), static_cast<unsigned>(diagnostic_flags));
+    // Keep legacy 45-field STATUS valid at the worst-case 511-byte width.
+    // The three optional fields are hex: disconnects, successful reconnects,
+    // and local uptime (milliseconds) of the most recent successful reconnect.
+    if (!wifi_telemetry_valid || base_length <= 0 ||
+        static_cast<std::size_t>(base_length) > kMaxPacketLength ||
+        static_cast<std::size_t>(base_length) >= capacity) return base_length;
+    const std::size_t remain = capacity - static_cast<std::size_t>(base_length);
+    const int appended = std::snprintf(destination + base_length, remain,
+                                      "|%X|%X|%llX",
+                                       static_cast<unsigned>(wifi_disconnect_count),
+                                       static_cast<unsigned>(wifi_reconnect_count),
+                                      static_cast<unsigned long long>(wifi_last_reconnect_uptime_ms));
+    if (appended <= 0 || static_cast<std::size_t>(appended) >= remain ||
+        static_cast<std::size_t>(base_length + appended) > kMaxPacketLength) {
+        destination[base_length] = '\0'; // Return the interoperable 45-field form.
+        return base_length;
+    }
+    return base_length + appended;
 }
 
 int FormatRunDiagnostic(char* destination, std::size_t capacity,

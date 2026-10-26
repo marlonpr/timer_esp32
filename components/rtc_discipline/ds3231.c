@@ -31,6 +31,16 @@ static inline uint8_t bcd2dec(uint8_t val)
     return (uint8_t)(((val >> 4) * 10u) + (val & 0x0Fu));
 }
 
+static void release_failed_init_bus(ds3231_dev_t *dev)
+{
+    const esp_err_t err = i2c_del_master_bus(dev->bus);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to release I2C bus after initialization error: %s",
+                 esp_err_to_name(err));
+    }
+    *dev = (ds3231_dev_t){0};
+}
+
 static esp_err_t ds3231_read_regs(ds3231_dev_t *dev,
                                   uint8_t start_reg,
                                   uint8_t *data,
@@ -45,7 +55,7 @@ static esp_err_t ds3231_read_regs(ds3231_dev_t *dev,
                                        1,
                                        data,
                                        len,
-                                       -1);
+                                       DS3231_I2C_TIMEOUT_MS);
 }
 
 static esp_err_t ds3231_write_reg(ds3231_dev_t *dev, uint8_t reg, uint8_t value)
@@ -55,7 +65,7 @@ static esp_err_t ds3231_write_reg(ds3231_dev_t *dev, uint8_t reg, uint8_t value)
     }
 
     const uint8_t data[2] = {reg, value};
-    return i2c_master_transmit(dev->dev, data, sizeof(data), -1);
+    return i2c_master_transmit(dev->dev, data, sizeof(data), DS3231_I2C_TIMEOUT_MS);
 }
 
 esp_err_t init_ds3231(ds3231_dev_t *out_dev)
@@ -81,6 +91,16 @@ esp_err_t init_ds3231(ds3231_dev_t *out_dev)
         return err;
     }
 
+    // Adding a device handle does not check that the RTC is present. Probe
+    // before the discipline attempts its startup register transactions.
+    err = i2c_master_probe(out_dev->bus, DS3231_I2C_ADDR, DS3231_I2C_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "DS3231 probe at 0x%02X failed (%s); check RTC wiring/pull-ups",
+                 DS3231_I2C_ADDR, esp_err_to_name(err));
+        release_failed_init_bus(out_dev);
+        return err;
+    }
+
     const i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = DS3231_I2C_ADDR,
@@ -90,6 +110,7 @@ esp_err_t init_ds3231(ds3231_dev_t *out_dev)
     err = i2c_master_bus_add_device(out_dev->bus, &dev_cfg, &out_dev->dev);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to add DS3231: %s", esp_err_to_name(err));
+        release_failed_init_bus(out_dev);
         return err;
     }
 
@@ -117,7 +138,7 @@ esp_err_t ds3231_set_time(ds3231_dev_t *dev, const ds3231_time_t *time)
     buf[6] = dec2bcd(time->month);
     buf[7] = dec2bcd((uint8_t)(time->year % 100u));
 
-    return i2c_master_transmit(dev->dev, buf, sizeof(buf), -1);
+    return i2c_master_transmit(dev->dev, buf, sizeof(buf), DS3231_I2C_TIMEOUT_MS);
 }
 
 esp_err_t ds3231_get_time(ds3231_dev_t *dev, ds3231_time_t *time)
@@ -216,8 +237,7 @@ esp_err_t ds3231_get_temperature_c(ds3231_dev_t *dev, float *temperature_c)
     }
 
     uint8_t raw[2];
-    const uint8_t reg = DS3231_REG_TEMP_MSB;
-    esp_err_t err = i2c_master_transmit_receive(dev->dev, &reg, 1, raw, sizeof(raw), 100);
+    esp_err_t err = ds3231_read_regs(dev, DS3231_REG_TEMP_MSB, raw, sizeof(raw));
     if (err != ESP_OK) {
         return err;
     }

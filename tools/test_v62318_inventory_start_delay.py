@@ -18,7 +18,7 @@ monitor = (ROOT/'components/factory_display/cpu0_latency_monitor.cpp').read_text
 run_prep = monitor.split('void cpu0_latency_monitor_prepare_run(',1)[1].split('void cpu0_latency_monitor_begin_run(',1)[0]
 assert 'RefreshTaskInventory();' not in run_prep
 assert 'now = factory_timer::InjectStartTaskTestDelay();' in main
-version = re.search(r'set\(PROJECT_VER "(\d+)\.(\d+)\.(\d+)"\)', (ROOT/'CMakeLists.txt').read_text())
+version = re.search(r'set\(PROJECT_VER "(\d+)\.(\d+)\.(\d+)(?:-[A-Za-z0-9.]+)?"\)', (ROOT/'CMakeLists.txt').read_text())
 assert version and tuple(map(int, version.groups())) >= (6, 23, 19)
 for n in range(1,16):
     normal = (ROOT/f'sdkconfig.esp{n:02d}').read_text()

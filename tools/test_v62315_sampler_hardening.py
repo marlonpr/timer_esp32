@@ -60,7 +60,7 @@ for k,v in checks.items(): print(f'{k}: {"PASS" if v else "FAIL"}')
 # Strong fleet invariant.
 r=subprocess.run([sys.executable,str(ROOT/'tools/generate_fleet_sdkconfigs.py'),'--start','1','--end','15','--check-only'],text=True,capture_output=True)
 print(r.stdout,end='')
-checks['ESP01-ESP15 identity-only']=r.returncode==0 and 'FLEET_PROFILE_VERIFY=PASS range=ESP01-ESP15' in r.stdout
+checks['ESP01-ESP15 identity/zone profiles']=r.returncode==0 and 'FLEET_PROFILE_VERIFY=PASS range=ESP01-ESP15' in r.stdout
 
 print(f'V6_23_15_SAMPLER_HARDENING={"PASS" if all(checks.values()) else "FAIL"}')
 raise SystemExit(0 if all(checks.values()) else 1)

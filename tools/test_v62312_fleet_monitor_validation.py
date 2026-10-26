@@ -32,8 +32,8 @@ for name,ok in checks.items():
  if not ok: failed.append(name)
 proc=subprocess.run([sys.executable,str(ROOT/'tools/generate_fleet_sdkconfigs.py'),'--check-only'],cwd=ROOT,text=True,capture_output=True)
 print(proc.stdout,end='')
-if proc.returncode: failed.append('fleet identity-only generator check')
+if proc.returncode: failed.append('fleet identity/zone generator check')
 if failed:
  print(f'FAIL: {len(failed)} v6.23.12 checks failed: {failed}')
  raise SystemExit(1)
-print(f'PASS: {len(checks)} source checks + identity-only fleet profile verification')
+print(f'PASS: {len(checks)} source checks + identity/zone fleet profile verification')

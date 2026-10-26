@@ -192,6 +192,21 @@ void CheckProtocolFormats() {
     CHECK(std::string_view(packet, static_cast<std::size_t>(length)) ==
           "FCT2|STATUS|ESP03|0123456789ABCDEF|RUNNING|19|-57|6|AA:BB:CC:DD:EE:FF|LOCKED|129|0.785|0|1|-6.500001|2|25.25|1|7|-987654|7654321|7654000|-987333|0|0|28|49|0|3039|0|0|0|0|0|0|NONE|0|0|0|0|0|0|0|00000000|00");
 
+    // New v6.24.4 optional Wi-Fi statistics: they must fit without changing
+    // the first 45 fields, and the fields must not appear in legacy calls.
+    length = factory_timer::FormatStatus(
+        packet, sizeof(packet), "ESP03", 0x0123456789abcdefULL,
+        factory_timer::TimerState::Finished, 0, -57, 6, "AA:BB:CC:DD:EE:FF", "LOCKED",
+        129, 0.785, 0, true, -6.500001, 2, 25.25, 1, 0x07,
+        -987654, 7654321, 7654000, -987333, 0, 0, 28, 49, 0,
+        12345, 0, 0, false, 0, 0, 0, "NONE", 0, 0, false, 0, 0, false,
+        0, "deadbeef", 0, true, 3, 2, 123456ULL);
+    CHECK(length > 0 && length <= static_cast<int>(factory_timer::kMaxPacketLength));
+    const std::string_view wifi_status(packet, static_cast<std::size_t>(length));
+    CHECK(wifi_status.find("|deadbeef|00|3|2|1E240") != std::string_view::npos);
+    CHECK(std::count(packet, packet + length, '|') == 47);
+
+    // The extended form must safely fall back to 45 fields at maximum width.
     // The extended fleet-health STATUS must still fit inside the advertised
     // protocol envelope even at conservative numeric extremes.
     length = factory_timer::FormatStatus(
@@ -203,7 +218,7 @@ void CheckProtocolFormats() {
         INT64_MIN, INT64_MIN, UINT32_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX,
         true, UINT32_MAX, UINT32_MAX, UINT32_MAX, "TASKNAME1234567",
         UINT32_MAX, UINT32_MAX, true, UINT32_MAX, UINT32_MAX, true,
-        UINT32_MAX, "deadbeef", 0xFF);
+        UINT32_MAX, "deadbeef", 0xFF, true, UINT32_MAX, UINT32_MAX, UINT64_MAX);
     CHECK(length > 0);
     CHECK(static_cast<std::size_t>(length) == factory_timer::kMaxPacketLength);
     CHECK(std::strlen(packet) == static_cast<std::size_t>(length));

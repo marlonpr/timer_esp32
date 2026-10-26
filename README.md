@@ -1,3 +1,29 @@
+# Firmware 6.24.3 — three zone APs by default
+
+Standard builds use FT-ZONE1/2/3 with idle roaming off. The supplied five-per-zone
+map is for the analyzer bench. Map installation boards by physical position;
+unequal counts such as 6/4/5 are supported by the deployment tools.
+Shared-SSID strongest-AP roaming is optional and uses separately generated
+profiles. Reconnect backoff remains enabled in both modes. Controller 6.23.6
+and analyzer 10.1.1 are unchanged.
+See [the current build and commissioning notes](../FIRMWARE_6_24_3_ZONE_DEFAULTS.md).
+
+# Firmware 6.24.2 — guarded idle roaming and reconnect backoff (historical)
+
+6.24.2 adds a Wi-Fi maintenance task, timing-control scan cancellation,
+idle-only same-SSID roaming below -70 dBm with a 10 dB improvement requirement,
+and 3-4 s reconnect pauses after three failures. Controller 6.23.6 and analyzer
+10.1.1 are unchanged. Optional zone profiles keep each board on its zone SSID.
+See [the 6.24.2 release notes](../FIRMWARE_6_24_2_WIFI_MAINTENANCE.md).
+
+# Firmware 6.24.1 — multi-AP selection and bounded RTC startup
+
+6.24.1 sets all-channel Wi-Fi scanning and signal-based AP ordering, probes the
+DS3231 at 0x68, and bounds every RTC transaction to 100 ms. A failed RTC startup
+returns to display/network startup, with RTC-dependent START blocked.
+See [the release notes](../FIRMWARE_6_24_1_AP_RTC.md) for tests and deployment.
+Controller 6.23.5 and analyzer 10.1.1 are unchanged.
+
 # Firmware 6.24.0 — segmented repetition release candidate
 
 See [the production implementation and validation notes](../SEGMENTED_REPETITIONS.md).

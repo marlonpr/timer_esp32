@@ -5,9 +5,9 @@
 namespace factory_timer {
 
 namespace {
-constexpr uint32_t kExpectedNetwork = 0xC0A80000u;  // 192.168.0.0
-constexpr uint32_t kExpectedNetmask = 0xFFFFFF00u;  // 255.255.255.0  /24
-constexpr uint32_t kExpectedGateway = 0xC0A80001u;  // 192.168.0.1
+	constexpr uint32_t kExpectedNetwork = 0xC0A80000u;  // 192.168.0.0
+	constexpr uint32_t kExpectedNetmask = 0xFFFF0000u;  // 255.255.0.0 /16
+	constexpr uint32_t kExpectedGateway = 0xC0A80001u;  // 192.168.0.1
 } // namespace
 
 bool ParseBssid(std::string_view text, std::array<uint8_t, 6>& value) {
@@ -27,9 +27,20 @@ bool ParseBssid(std::string_view text, std::array<uint8_t, 6>& value) {
 }
 
 bool IsAcceptedFactoryNetwork(uint32_t ip, uint32_t netmask, uint32_t gateway) {
-    return netmask == kExpectedNetmask &&
-           (ip & netmask) == kExpectedNetwork &&
-           gateway == kExpectedGateway;
+    if (netmask != kExpectedNetmask ||
+        gateway != kExpectedGateway) {
+        return false;
+    }
+
+    if ((ip & netmask) != kExpectedNetwork) {
+        return false;
+    }
+
+    const uint32_t broadcast = kExpectedNetwork | ~kExpectedNetmask;
+
+    return ip != kExpectedNetwork &&
+           ip != broadcast &&
+           ip != kExpectedGateway;
 }
 
 } // namespace factory_timer

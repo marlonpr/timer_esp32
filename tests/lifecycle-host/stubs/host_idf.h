@@ -16,6 +16,12 @@ extern size_t host_output_used;
 extern unsigned host_inventory_calls;
 extern bool host_monitoring;
 #endif
+#ifdef FACTORY_OUTPUT_HOST_HOOKS
+int host_output_start_timer(uint64_t delay);
+int host_output_stop_timer(void);
+void host_output_gpio_write(int pin,uint32_t level);
+void host_output_gpio_configure(uint64_t mask);
+#endif
 #ifdef FACTORY_DISPLAY_HOST_HOOKS
 int host_queue_receive(void* out, uint32_t timeout);
 int host_queue_overwrite(const void* value);
@@ -158,11 +164,14 @@ static inline esp_err_t gptimer_set_alarm_action(gptimer_handle_t h,const gptime
 typedef void* esp_timer_handle_t;
 typedef struct {void(*callback)(void*);void* arg;int dispatch_method;const char* name;bool skip_unhandled_events;} esp_timer_create_args_t;
 #define ESP_TIMER_ISR 1
+#define ESP_TIMER_TASK 0
 static inline esp_err_t esp_timer_create(const esp_timer_create_args_t* a,esp_timer_handle_t* t) {(void)a;*t=(void*)1;return ESP_OK;}
 static inline esp_err_t esp_timer_start_once(esp_timer_handle_t t,uint64_t d) {
     (void)t;
 #ifdef FACTORY_DISPLAY_HOST_HOOKS
     return host_start_publication(d);
+#elif defined(FACTORY_OUTPUT_HOST_HOOKS)
+    return host_output_start_timer(d);
 #else
     (void)d;return ESP_OK;
 #endif
@@ -171,6 +180,8 @@ static inline esp_err_t esp_timer_stop(esp_timer_handle_t t) {
     (void)t;
 #ifdef FACTORY_DISPLAY_HOST_HOOKS
     return host_stop_publication();
+#elif defined(FACTORY_OUTPUT_HOST_HOOKS)
+    return host_output_stop_timer();
 #else
     return ESP_OK;
 #endif
@@ -198,9 +209,22 @@ typedef struct {uint64_t pin_bit_mask;int mode;int pull_up_en;int pull_down_en;i
 #define GPIO_IS_VALID_GPIO(g) ((g)>=0&&(g)<49)
 #define ESP_INTR_FLAG_IRAM 1
 #define ESP_INTR_FLAG_LEVEL1 2
-static inline esp_err_t gpio_config(const gpio_config_t* c) {(void)c;return ESP_OK;}
+static inline esp_err_t gpio_config(const gpio_config_t* c) {
+#ifdef FACTORY_OUTPUT_HOST_HOOKS
+host_output_gpio_configure(c->pin_bit_mask);
+#else
+(void)c;
+#endif
+return ESP_OK;}
 static inline int gpio_get_level(gpio_num_t g) {(void)g;return 0;}
-static inline esp_err_t gpio_set_level(gpio_num_t g,uint32_t v) {(void)g;(void)v;return ESP_OK;}
+static inline esp_err_t gpio_set_level(gpio_num_t g,uint32_t v) {
+#ifdef FACTORY_OUTPUT_HOST_HOOKS
+host_output_gpio_write(g,v);
+#else
+(void)g;(void)v;
+#endif
+return ESP_OK;}
+
 static inline esp_err_t gpio_install_isr_service(int flags) {(void)flags;return ESP_OK;}
 static inline esp_err_t gpio_isr_handler_add(gpio_num_t g,void(*f)(void*),void* a) {(void)g;(void)f;(void)a;return ESP_OK;}
 static inline esp_err_t gpio_isr_handler_remove(gpio_num_t g) {(void)g;return ESP_OK;}

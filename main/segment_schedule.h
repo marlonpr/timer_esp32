@@ -8,28 +8,33 @@ namespace factory_timer {
 constexpr uint32_t kMaximumRepeatDurationSeconds = 5999;
 constexpr uint32_t kMaximumSegmentDurationSeconds = 6000;
 
-inline uint64_t SegmentSeconds(uint32_t duration, uint32_t repeats) {
-    return static_cast<uint64_t>(duration) * repeats;
+constexpr uint32_t kRepetitionLogoSeconds = 4;
+
+inline uint64_t SegmentSeconds(uint32_t duration, uint32_t repeats, uint32_t logo_seconds = 0) {
+    return (static_cast<uint64_t>(duration) + logo_seconds) * repeats;
 }
 
 inline bool ValidSegment(uint32_t duration, uint32_t repeats, uint32_t first,
-                         uint32_t total, uint32_t segment) {
+                         uint32_t total, uint32_t segment, uint32_t logo_seconds = 0) {
+    // The last logo follows the last countdown; it never precedes another
+    // countdown at an older sync age. Internal logo gaps do count against cap.
     return duration > 0 && duration <= kMaximumRepeatDurationSeconds && repeats > 0 &&
            first > 0 && total > 0 && segment > 0 &&
+           (logo_seconds == 0 || logo_seconds == kRepetitionLogoSeconds) &&
            static_cast<uint64_t>(first) + repeats - 1 <= total &&
-           SegmentSeconds(duration, repeats) <= kMaximumSegmentDurationSeconds;
+           SegmentSeconds(duration, repeats, logo_seconds) - logo_seconds <= kMaximumSegmentDurationSeconds;
 }
 
-inline uint32_t RepeatRemaining(uint32_t duration, uint32_t repeats, uint64_t elapsed) {
-    if (duration == 0 || elapsed >= SegmentSeconds(duration, repeats)) return 0;
-    // At an internal boundary, go directly from 00:01 to the next repeat's D.
-    return duration - static_cast<uint32_t>(elapsed % duration);
+inline uint32_t RepeatRemaining(uint32_t duration, uint32_t repeats, uint64_t elapsed, uint32_t logo_seconds = 0) {
+    if (duration == 0 || elapsed >= SegmentSeconds(duration, repeats, logo_seconds)) return 0;
+    const uint32_t phase = static_cast<uint32_t>(elapsed % (duration + logo_seconds));
+    return phase < duration ? duration - phase : 0;
 }
 
 inline uint32_t RepeatIndex(uint32_t duration, uint32_t repeats, uint32_t first,
-                            uint64_t elapsed) {
+                            uint64_t elapsed, uint32_t logo_seconds = 0) {
     if (duration == 0 || repeats == 0) return first;
-    return first + static_cast<uint32_t>(std::min<uint64_t>(elapsed / duration, repeats - 1));
+    return first + static_cast<uint32_t>(std::min<uint64_t>(elapsed / (duration + logo_seconds), repeats - 1));
 }
 
 // A complete fit window after a discontinuity is required; old cumulative

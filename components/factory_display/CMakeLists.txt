@@ -1,5 +1,6 @@
 set(FACTORY_DISPLAY_SRCS
     "factory_display.cpp"
+    "repetition_output.cpp"
     "cpu0_latency_monitor.cpp"
     "logo_bitmap.cpp"
 )
@@ -27,7 +28,7 @@ else()
     message(FATAL_ERROR "factory_display supports only ESP32 and ESP32-S3")
 endif()
 
-list(APPEND FACTORY_DISPLAY_REQUIRES rtc_discipline)
+list(APPEND FACTORY_DISPLAY_REQUIRES rtc_discipline esp_driver_gpio)
 
 idf_component_register(
     SRCS ${FACTORY_DISPLAY_SRCS}

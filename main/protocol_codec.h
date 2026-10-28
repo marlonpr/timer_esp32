@@ -54,6 +54,7 @@ struct CommandPacket {
     uint32_t total_repeats{1};
     uint64_t expected_boot_id{};
     uint64_t expected_previous_command_id{};
+    uint32_t logo_seconds{};
 };
 
 struct SyncRequestPacket {

@@ -2095,6 +2095,15 @@ void CommandTask(void *) {
                         const auto snapshot = countdown.Snapshot();
                         xSemaphoreGive(countdown_mutex);
                         SendStatus(socket_fd, peer, snapshot);
+                    } else if (command.logo_seconds != 0 &&
+#if defined(CONFIG_FACTORY_DISPLAY_TEST) && CONFIG_FACTORY_DISPLAY_TEST
+                               !factory_display_output_ready()
+#else
+                               true
+#endif
+                               ) {
+                        ESP_LOGE(kTag, "START refused: GPIO33 output is unavailable");
+                        SendAck(socket_fd, peer, command, factory_timer::AckResult::Invalid);
                     } else if ((command.type == factory_timer::CommandType::StartAt ||
                                 command.type == factory_timer::CommandType::Start) &&
                                !RtcRunGateQualified(nullptr, command.plan_id != 0)) {
@@ -2160,7 +2169,7 @@ void CommandTask(void *) {
                         if (trace_status_path) status_trace.discipline_end_us = esp_timer_get_time();
 #endif
                         const auto processing = factory_timer::ProcessCommand(
-                            countdown, command, receive_local_us, local_start_us,
+                            countdown, command, command.logo_seconds ? esp_timer_get_time() : receive_local_us, local_start_us,
                             receive_disciplined_us);
 #if defined(CONFIG_FACTORY_RX_BOUNDARY_TRACE) && CONFIG_FACTORY_RX_BOUNDARY_TRACE
                         if (trace_status_path) {
@@ -2239,9 +2248,9 @@ void CommandTask(void *) {
                                 countdown.SetScheduledRunningMicroseconds(target_disciplined_us);
                                 ArmStartTimerLocked(armed_local_us);
 #if defined(CONFIG_FACTORY_DISPLAY_TEST) && CONFIG_FACTORY_DISPLAY_TEST
-                                factory_display_arm_segment(armed_local_us, target_disciplined_us,
+                                factory_display_arm_program(armed_local_us, target_disciplined_us,
                                                     processing.snapshot.duration_seconds,
-                                                    processing.snapshot.repeat_count, command.command_id);
+                                                    processing.snapshot.repeat_count, command.logo_seconds, command.command_id);
 #endif
                             } else if (command.type == factory_timer::CommandType::Reset) {
                                 last_start_health = {};

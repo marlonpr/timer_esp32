@@ -1,3 +1,21 @@
+# Firmware 6.24.7-rc1 — GPIO33 active-LOW
+
+GPIO33 is LOW while ON and HIGH while OFF. Startup signals for four seconds;
+every end-of-repetition logo signals with four 500 ms LOW / 500 ms HIGH cycles.
+STOP/RESET and completion return HIGH. COMMIT stays GPIO17. Keep the current
+controller 6.23.17 and analyzer; rebuild/reflash the timer firmware only.
+See [build and verification notes](../ACTIVE_LOW_fw6_24_7.md).
+
+The entries below are historical and describe their original polarity.
+
+# Firmware 6.24.6-rc1 — GPIO33 output and repetition logos
+
+GPIO33 provides a four-second startup HIGH pulse and four 500 ms ON/OFF cycles
+during each four-second logo. COMMIT diagnostics now use GPIO17; move analyzer
+leads from GPIO33. Requires controller 6.23.17 for logo-enabled production runs.
+See [build, wiring and timing notes](../LOGO_OUTPUT_fw6_24_6_ctl6_23_17.md).
+The entries below are historical.
+
 # Firmware 6.24.3 — three zone APs by default
 
 Standard builds use FT-ZONE1/2/3 with idle roaming off. The supplied five-per-zone

@@ -79,7 +79,10 @@ bool ParseCommandFields(std::string_view packet, CommandPacket& output, ParseErr
     std::array<std::string_view, 6> fields{};
     if (!SplitExact(packet, fields)) {
         std::array<std::string_view, 13> segment{};
-        if (!SplitExact(packet, segment) || segment[0] != kVersion2 ||
+        std::array<std::string_view, 14> extended{};
+        const bool has_logo = SplitExact(packet, extended);
+        if (has_logo) std::copy_n(extended.begin(), segment.size(), segment.begin());
+        if ((!has_logo && !SplitExact(packet, segment)) || segment[0] != kVersion2 ||
             segment[1] != "CMD" || segment[2] != "START_AT") {
             error = ParseError::FieldCount;
             return false;
@@ -90,7 +93,8 @@ bool ParseCommandFields(std::string_view packet, CommandPacket& output, ParseErr
             std::string(segment[4]) + "|" + std::string(segment[5]);
         CommandPacket parsed{};
         if (!ParseCommandFields(base, parsed, error)) return false;
-        if (!ParseCommandId(segment[6], parsed.plan_id) ||
+        if ((has_logo && (!ParseDecimal(extended[13], parsed.logo_seconds) || parsed.logo_seconds != kRepetitionLogoSeconds)) ||
+            !ParseCommandId(segment[6], parsed.plan_id) ||
             !ParseDecimal(segment[7], parsed.segment_index) ||
             !ParseDecimal(segment[8], parsed.repeat_count) ||
             !ParseDecimal(segment[9], parsed.first_repeat) ||
@@ -98,7 +102,7 @@ bool ParseCommandFields(std::string_view packet, CommandPacket& output, ParseErr
             !ParseCommandId(segment[11], parsed.expected_boot_id) ||
             !(segment[12] == "0000000000000000" || ParseCommandId(segment[12], parsed.expected_previous_command_id)) ||
             !ValidSegment(parsed.duration_seconds, parsed.repeat_count, parsed.first_repeat,
-                          parsed.total_repeats, parsed.segment_index)) {
+                          parsed.total_repeats, parsed.segment_index, parsed.logo_seconds)) {
             error = ParseError::Duration;
             return false;
         }
@@ -522,7 +526,7 @@ int FormatExecutionStatus(char* destination, std::size_t capacity,
                           int64_t tstar_local_us, uint16_t rtc_recovered_edges, int64_t phase_us) {
     if (destination == nullptr || capacity == 0 || !ValidDeviceId(device_id) || boot_id == 0) return -1;
     return std::snprintf(destination, capacity,
-        "FCT2|EXEC_STATUS|%.*s|%016llX|%016llX|%016llX|%u|%016llX|%s|%u|%u|%u|%u|%u|%u|%lld|%lld|%u|%lld",
+        "FCT2|EXEC_STATUS|%.*s|%016llX|%016llX|%016llX|%u|%016llX|%s|%u|%u|%u|%u|%u|%u|%lld|%lld|%u|%lld|%u",
         static_cast<int>(device_id.size()), device_id.data(),
         static_cast<unsigned long long>(response_id), static_cast<unsigned long long>(boot_id),
         static_cast<unsigned long long>(s.plan_id), static_cast<unsigned>(s.segment_index),
@@ -531,7 +535,7 @@ int FormatExecutionStatus(char* destination, std::size_t capacity,
         static_cast<unsigned>(s.first_repeat), static_cast<unsigned>(s.total_repeats),
         static_cast<unsigned>(s.current_repeat), static_cast<unsigned>(s.elapsed_segment_seconds),
         static_cast<long long>(s.target_master_us), static_cast<long long>(tstar_local_us),
-        static_cast<unsigned>(rtc_recovered_edges), static_cast<long long>(phase_us));
+        static_cast<unsigned>(rtc_recovered_edges), static_cast<long long>(phase_us), static_cast<unsigned>(s.logo_seconds));
 }
 
 int FormatSyncReply(char* destination, std::size_t capacity, std::string_view device_id,

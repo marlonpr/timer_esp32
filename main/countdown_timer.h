@@ -1,6 +1,7 @@
 #pragma once
 
 #include "protocol_codec.h"
+#include "segment_schedule.h"
 
 #include <array>
 #include <cstddef>
@@ -22,7 +23,8 @@ struct TimerSnapshot {
     uint32_t elapsed_segment_seconds{};
     int64_t target_master_us{};
     int64_t elapsed_segment_microseconds{};
-    uint32_t SegmentDurationSeconds() const { return duration_seconds * repeat_count; }
+    uint32_t logo_seconds{};
+    uint32_t SegmentDurationSeconds() const { return static_cast<uint32_t>(SegmentSeconds(duration_seconds, repeat_count, logo_seconds)); }
 
     bool operator==(const TimerSnapshot& other) const {
         return state == other.state && remaining_seconds == other.remaining_seconds &&

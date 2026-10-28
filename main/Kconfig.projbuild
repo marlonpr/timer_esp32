@@ -317,7 +317,7 @@ config FACTORY_ANALYZER_PRESENTATION_OFFSET_US
     default 0
     depends on IDF_TARGET_ESP32
     help
-        Adds a diagnostic-only offset to GPIO33 presentation deadlines while
+        Adds a diagnostic-only offset to COMMIT presentation deadlines while
         leaving TimerTask/master START time unchanged. Set ESP02 to +50 us in
         Analyzer runs so the two COMMIT edges do not enter the analyzer's roughly
         5-10 us close-edge distortion zone.
@@ -367,13 +367,13 @@ config FACTORY_DISPLAY_EDGE_DIAGNOSTICS
 config FACTORY_DISPLAY_EDGE_GPIO
     int "Display presentation-commit diagnostic GPIO"
     range 0 48
-    default 33 if IDF_TARGET_ESP32
+    default 17 if IDF_TARGET_ESP32
     default 14 if IDF_TARGET_ESP32S3
-    default 33
+    default 17
     depends on FACTORY_DISPLAY_EDGE_DIAGNOSTICS
     help
         GPIO connected to the analyzer for presentation-commit toggles. The
-        current defaults are free in the validated panel pin maps: GPIO33 on
+        current defaults are free in the validated panel pin maps: GPIO17 on
         classic ESP32 and GPIO14 on ESP32-S3. Recheck if board wiring changes.
 
 config FACTORY_DISPLAY_REFRESH_EDGE_DIAGNOSTICS

@@ -1,6 +1,7 @@
 #include "factory_display.h"
 #include "../../main/segment_schedule.h"
 #include "display_backend.h"
+#include "repetition_output.h"
 #include "cpu0_latency_monitor.h"
 #include "logo_bitmap.h"
 #include "rtc_discipline.h"
@@ -93,6 +94,7 @@ struct DisplayCommand {
     uint32_t duration_seconds{};
     uint64_t command_id{};
     uint32_t repeat_count{1};
+    uint32_t logo_seconds{};
 };
 
 struct BoundaryTraceRecord {
@@ -1367,10 +1369,11 @@ void DisplayTask(void*) {
 #endif
 
 #if CONFIG_IDF_TARGET_ESP32
-        for (uint32_t elapsed = 1; elapsed <= factory_timer::SegmentSeconds(command.duration_seconds, command.repeat_count); ++elapsed) {
-            const uint32_t remaining = factory_timer::RepeatRemaining(command.duration_seconds, command.repeat_count, elapsed);
+        for (uint32_t elapsed = 1; elapsed <= factory_timer::SegmentSeconds(command.duration_seconds, command.repeat_count, command.logo_seconds); ++elapsed) {
+            const uint32_t remaining = factory_timer::RepeatRemaining(command.duration_seconds, command.repeat_count, elapsed, command.logo_seconds);
             if (remaining == 0) {
-                RenderFinishedToBackBuffer();
+                if (command.logo_seconds != 0) RenderIdleToBackBuffer();
+                else RenderFinishedToBackBuffer();
             } else {
                 RenderRunningToBackBuffer(remaining);
             }
@@ -1449,10 +1452,11 @@ void DisplayTask(void*) {
             s_prepared_sequence.store(0, std::memory_order_release);
         }
 #else
-        for (uint32_t elapsed = 1; elapsed <= factory_timer::SegmentSeconds(command.duration_seconds, command.repeat_count); ++elapsed) {
-            const uint32_t remaining = factory_timer::RepeatRemaining(command.duration_seconds, command.repeat_count, elapsed);
+        for (uint32_t elapsed = 1; elapsed <= factory_timer::SegmentSeconds(command.duration_seconds, command.repeat_count, command.logo_seconds); ++elapsed) {
+            const uint32_t remaining = factory_timer::RepeatRemaining(command.duration_seconds, command.repeat_count, elapsed, command.logo_seconds);
             if (remaining == 0) {
-                RenderFinishedToBackBuffer();
+                if (command.logo_seconds != 0) RenderIdleToBackBuffer();
+                else RenderFinishedToBackBuffer();
             } else {
                 RenderRunningToBackBuffer(remaining);
             }
@@ -1639,6 +1643,12 @@ extern "C" bool factory_display_init(const char* device_id, uint8_t brightness) 
 #endif
 #endif
 
+    if (!factory_output::Init()) {
+        ESP_LOGE(kTag, "GPIO33 repetition output could not initialize; logo START will be refused");
+    } else {
+        ESP_LOGI(kTag, "Repetition output ready: GPIO33 active=LOW idle=HIGH startup=4s LOW logo=4s blink=500ms LOW/500ms HIGH");
+    }
+
     // Establish a known visible idle frame before the scheduler task starts.
     RenderIdleToBackBuffer();
     factory_display_backend_flip();
@@ -1679,11 +1689,19 @@ extern "C" void factory_display_arm(int64_t local_start_us,
 }
 
 extern "C" void factory_display_arm_segment(int64_t local_start_us, int64_t start_disciplined_us,
-                                              uint32_t duration_seconds, uint32_t repeat_count,
-                                              uint64_t command_id) {
+    uint32_t duration_seconds, uint32_t repeat_count, uint64_t command_id) {
+    factory_display_arm_program(local_start_us, start_disciplined_us, duration_seconds, repeat_count, 0, command_id);
+}
+
+extern "C" bool factory_display_output_ready(void) { return factory_output::Ready(); }
+
+extern "C" void factory_display_arm_program(int64_t local_start_us, int64_t start_disciplined_us,
+    uint32_t duration_seconds, uint32_t repeat_count, uint32_t logo_seconds, uint64_t command_id) {
     if (!s_ready.load() || s_command_queue == nullptr || repeat_count == 0) return;
+    factory_output::Schedule(start_disciplined_us, duration_seconds, repeat_count, logo_seconds);
     DisplayCommand command{};
     command.repeat_count = repeat_count;
+    command.logo_seconds = logo_seconds;
     command.type = DisplayCommand::Type::Arm;
     command.local_start_us = local_start_us;
     command.start_disciplined_us = start_disciplined_us;
@@ -1715,6 +1733,7 @@ extern "C" void factory_display_begin_run_monitor(uint64_t command_id,
 }
 
 extern "C" void factory_display_reset(void) {
+    factory_output::Cancel();
     if (!s_ready.load() || s_command_queue == nullptr) return;
     DisplayCommand command{};
     command.type = DisplayCommand::Type::Reset;

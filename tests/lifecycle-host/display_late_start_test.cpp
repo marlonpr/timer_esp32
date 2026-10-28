@@ -119,3 +119,8 @@ int main() {
                  <<" boundaries=31 adjacent_scheduled_us=1000000 commit_delays_us=0 inventory_calls=1\n";
     }
 }
+
+namespace factory_output {
+bool Init(){return true;} bool Ready(){return true;}
+void Schedule(int64_t,uint32_t,uint32_t,uint32_t){} void Cancel(){}
+}

@@ -47,7 +47,7 @@ with tempfile.TemporaryDirectory(prefix='factory_epoch_mutation_') as td:
     mutant.write_text(head+'void DisplayTask(void*) {'+body)
     exe=folder/'epoch_mutant'
     command=['g++','-std=c++17','-Wall','-Wextra','-Werror','-Wno-unused-function',
-        '-DCONFIG_FACTORY_DISPLAY_EDGE_DIAGNOSTICS=1','-DCONFIG_FACTORY_DISPLAY_EDGE_GPIO=33',
+        '-DCONFIG_FACTORY_DISPLAY_EDGE_DIAGNOSTICS=1','-DCONFIG_FACTORY_DISPLAY_EDGE_GPIO=17',
         '-DCONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=1','-DCONFIG_FACTORY_START_TASK_TEST_DELAY_US=500',
         f'-DFACTORY_DISPLAY_SOURCE_PATH="{mutant}"',
         '-I',str(ROOT/'tests/lifecycle-host/stubs'),'-I',str(ROOT/'components/rtc_discipline'),

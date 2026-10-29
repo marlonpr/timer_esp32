@@ -24,7 +24,8 @@ struct TimerSnapshot {
     int64_t target_master_us{};
     int64_t elapsed_segment_microseconds{};
     uint32_t logo_seconds{};
-    uint32_t SegmentDurationSeconds() const { return static_cast<uint32_t>(SegmentSeconds(duration_seconds, repeat_count, logo_seconds)); }
+    uint32_t repeat_start_seconds{};
+    uint32_t SegmentDurationSeconds() const { return static_cast<uint32_t>(SegmentSeconds(duration_seconds, repeat_count, logo_seconds, repeat_start_seconds)); }
 
     bool operator==(const TimerSnapshot& other) const {
         return state == other.state && remaining_seconds == other.remaining_seconds &&

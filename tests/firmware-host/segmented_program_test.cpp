@@ -14,10 +14,10 @@ CommandPacket Segment(uint32_t d, uint32_t n, uint32_t first=1, uint32_t total=3
     c.expected_boot_id=0x456;
     return c;
 }
-void Schedule(uint32_t d,uint32_t n,uint32_t first,uint32_t total,uint32_t logo=0) {
+void Schedule(uint32_t d,uint32_t n,uint32_t first,uint32_t total,uint32_t logo=0,uint32_t start=0) {
     CountdownTimer t;
-    auto c=Segment(d,n,first,total);c.logo_seconds=logo;
-    const uint32_t seconds=(d+logo)*n;
+    auto c=Segment(d,n,first,total);c.logo_seconds=logo;c.repeat_start_seconds=start;
+    const uint32_t seconds=(d+logo)*n+start*(n-1);
     assert(t.Apply(c,1000000,6000000)==AckResult::Accepted);
     constexpr int64_t epoch=14000000;
     t.SetScheduledRunningMicroseconds(epoch);
@@ -27,8 +27,10 @@ void Schedule(uint32_t d,uint32_t n,uint32_t first,uint32_t total,uint32_t logo=
     for(uint32_t second=0;second<=seconds;++second){
         s=t.Update(6000000+int64_t(second)*1000000,epoch+int64_t(second)*1000000);
         assert(s.elapsed_segment_seconds==second);
-        assert(s.remaining_seconds==(second==seconds || second%(d+logo)>=d ? 0 : d-second%(d+logo)));
-        assert(s.current_repeat==first+std::min(second/(d+logo),n-1));
+        const uint32_t phase=second%(d+logo+start);
+        assert(s.remaining_seconds==(second==seconds || phase>=d ? 0 : d-phase));
+        const uint32_t offset=second/(d+logo+start)+(start && second<seconds && phase>=d+logo ? 1u : 0u);
+        assert(s.current_repeat==first+std::min(offset,n-1));
         assert(s.state==(second==seconds ? TimerState::Finished : TimerState::Running));
     }
     assert(t.Apply(c,INT64_MAX,6000000)==AckResult::Duplicate);
@@ -37,8 +39,15 @@ void Schedule(uint32_t d,uint32_t n,uint32_t first,uint32_t total,uint32_t logo=
     assert(t.Apply(changed,1,6000000)==AckResult::Invalid);
     changed=c;changed.logo_seconds=logo==0?4:0;
     assert(t.Apply(changed,1,6000000)==AckResult::Invalid);
+    changed=c;changed.repeat_start_seconds=start==0?4:0;
+    assert(t.Apply(changed,1,6000000)==AckResult::Invalid);
 }
 int main(){
+    Schedule(20,3,1,3,4,4);Schedule(1,3,1,3,4,4);Schedule(5999,1,1,1,4,4);Schedule(180,3,4,10,4,4);
+    assert(ValidSegment(2996,2,1,2,1,4,4));
+    assert(!ValidSegment(2997,2,1,2,1,4,4));
+    assert(!ValidSegment(20,3,1,3,1,0,4));
+    assert(!ValidSegment(20,3,1,3,1,4,3));
     Schedule(20,3,1,3,4);Schedule(1,3,1,3,4);Schedule(5999,1,1,1,4);
     assert(!ValidSegment(3000,2,1,2,1,4));
     assert(ValidSegment(5999,1,1,1,1,4));
@@ -84,6 +93,8 @@ int main(){
     assert(ParseCommand(wire,parsed,error));assert(parsed.repeat_count==30 && parsed.expected_boot_id==0x456);
     assert(!ParseCommand(wire+"|0",parsed,error));
     assert(ParseCommand(wire+"|4",parsed,error) && parsed.logo_seconds==4);
+    assert(ParseCommand(wire+"|4|4",parsed,error) && parsed.repeat_start_seconds==4);
+    for(auto bad:{"|4|0","|4|3","|4|5","|0|4","|4|4|4"})assert(!ParseCommand(wire+bad,parsed,error));
     for(auto bad:{"|3","|5","|4|1"})assert(!ParseCommand(wire+bad,parsed,error));
     assert(!ParseCommand("FCT2|CMD|START_AT|000000000000000B|5999|9000000|0000000000000123|1|2|1|2|0000000000000456|0000000000000000",parsed,error));
     const std::string maximum_command="FCT2|CMD|START_AT|FFFFFFFFFFFFFFFF|1|9223372036854775807|FFFFFFFFFFFFFFFF|4294967295|6000|4294961296|4294967295|FFFFFFFFFFFFFFFF|FFFFFFFFFFFFFFFF";
@@ -92,7 +103,7 @@ int main(){
     std::cout<<"SEGMENT_COMMAND_MAX_WIDTH_BYTES="<<maximum_command.size()<<'\n';
     char buffer[kMaxPacketLength+1];
     TimerSnapshot maximum{TimerState::Finished,UINT32_MAX,UINT32_MAX,UINT64_MAX,
-        UINT64_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX,INT64_MAX,INT64_MAX,UINT32_MAX};
+        UINT64_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX,UINT32_MAX,INT64_MAX,INT64_MAX,UINT32_MAX,UINT32_MAX};
     int length=FormatExecutionStatus(buffer,sizeof(buffer),"ESP15",UINT64_MAX,UINT64_MAX,maximum,INT64_MAX,UINT16_MAX,INT64_MIN);
     assert(length>0 && length<=int(kMaxPacketLength) && std::strlen(buffer)==size_t(length));
     std::cout<<"EXEC_STATUS_MAX_WIDTH_BYTES="<<length<<'\n';
@@ -101,8 +112,13 @@ int main(){
     std::cout<<"EXEC_STATUS_FIXTURE="<<buffer<<'\n';
     TimerSnapshot logo_fixture{TimerState::Running,0,20,11,0x123,1,3,1,3,1,20,9000000,20000500,4};
     FormatExecutionStatus(buffer,sizeof(buffer),"ESP01",0x789,0x456,logo_fixture,6000000,129,20000500);
-    assert(std::string(buffer)=="FCT2|EXEC_STATUS|ESP01|0000000000000789|0000000000000456|0000000000000123|1|000000000000000B|RUNNING|20|3|1|3|1|20|9000000|6000000|129|20000500|4");
+    assert(std::string(buffer)=="FCT2|EXEC_STATUS|ESP01|0000000000000789|0000000000000456|0000000000000123|1|000000000000000B|RUNNING|20|3|1|3|1|20|9000000|6000000|129|20000500|4|0");
     std::cout<<"LOGO_EXEC_STATUS_FIXTURE="<<buffer<<'\n';
+    logo_fixture.repeat_start_seconds=4;logo_fixture.current_repeat=2;
+    logo_fixture.elapsed_segment_seconds=24;
+    FormatExecutionStatus(buffer,sizeof(buffer),"ESP01",0x789,0x456,logo_fixture,6000000,129,24000500);
+    assert(std::string(buffer)=="FCT2|EXEC_STATUS|ESP01|0000000000000789|0000000000000456|0000000000000123|1|000000000000000B|RUNNING|20|3|1|3|2|24|9000000|6000000|129|24000500|4|4");
+    std::cout<<"REPEAT_START_EXEC_STATUS_FIXTURE="<<buffer<<'\n';
     length=FormatSyncReply(buffer,sizeof(buffer),"ESP15",UINT64_MAX,INT64_MAX,INT64_MAX,INT64_MAX,INT64_MAX,UINT32_MAX,true,INT32_MAX,"FE:FF:FF:FF:FF:FF");
     assert(length>0 && length<=int(kMaxPacketLength));
     std::array<uint8_t,6> bssid{};

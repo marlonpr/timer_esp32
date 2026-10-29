@@ -1,3 +1,13 @@
+# Firmware 6.24.8-rc1 — optional repetition-start logo and output
+
+The controller can request a four-second start logo and steady active-LOW GPIO33
+signal before each internal repetition, following its existing end blink. All
+numeric countdowns retain their full duration and the same absolute RTC schedule.
+Use controller 6.23.18. COMMIT remains GPIO17; profiles and analyzer are unchanged.
+See [build and bench notes](../REPETITION_OPTIONS_fw6_24_8_ctl6_23_18.md).
+
+The entries below are historical.
+
 # Firmware 6.24.7-rc1 — GPIO33 active-LOW
 
 GPIO33 is LOW while ON and HIGH while OFF. Startup signals for four seconds;

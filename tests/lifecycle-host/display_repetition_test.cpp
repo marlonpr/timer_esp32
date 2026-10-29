@@ -89,15 +89,15 @@ unsigned host_wait_for_publication() {
 int main() {
     s_ready.store(true);s_command_queue=(void*)1;s_display_task=(void*)1;s_boundary_publish_timer=(void*)1;
     factory_display_cache_runtime_inventory();host_monitoring=true;
-    const std::tuple<uint32_t,uint32_t,uint32_t> cases[]={{20,1,0},{20,3,0},{5,30,0},{3000,2,0},{5999,1,0},{180,3,0},{1,100,0},{20,3,4},{5,30,4},{1,3,4},{5999,1,4},{180,3,4}};
+    const std::tuple<uint32_t,uint32_t,uint32_t,uint32_t> cases[]={{20,1,0,0},{20,3,0,0},{5,30,0,0},{3000,2,0,0},{5999,1,0,0},{180,3,0,0},{1,100,0,0},{20,3,4,0},{5,30,4,0},{1,3,4,0},{5999,1,4,0},{180,3,4,0},{20,3,4,4},{5,30,4,4},{1,3,4,4},{5999,1,4,4},{180,3,4,4},{20,1,4,4}};
     uint64_t command=0;
-    for(auto [duration,repeats,logo]:cases){
+    for(auto [duration,repeats,logo,start]:cases){
         ++command;
         frames.clear();targets.clear();
         std::vector<Frame> expected;
-        const uint32_t seconds=(duration+logo)*repeats;
+        const uint32_t seconds=(duration+logo)*repeats+start*(repeats-1);
         for(uint32_t n=0;n<=seconds;++n){
-            const uint32_t phase=n%(duration+logo);
+            const uint32_t phase=n%(duration+logo+start);
             if(logo && (phase>=duration || n==seconds))RenderIdleToBackBuffer();
             else if(n==seconds)RenderFinishedToBackBuffer();
             else RenderRunningToBackBuffer(duration-phase);
@@ -107,12 +107,12 @@ int main() {
         const int64_t disciplined_tstar=rtc_discipline_local_to_disciplined_us(local_tstar);
         factory_timer::CommandPacket arm{};
         arm.type=factory_timer::CommandType::StartAt;arm.command_id=command;arm.duration_seconds=duration;
-        arm.repeat_count=repeats;arm.total_repeats=repeats;arm.logo_seconds=logo;
+        arm.repeat_count=repeats;arm.total_repeats=repeats;arm.logo_seconds=logo;arm.repeat_start_seconds=start;
         assert(countdown.Apply(arm,host_now_us,local_tstar)==factory_timer::AckResult::Accepted);
         countdown.SetScheduledRunningMicroseconds(disciplined_tstar);
         started=false;
         factory_display_begin_run_monitor(command,local_tstar);
-        factory_display_arm_program(local_tstar,disciplined_tstar,duration,repeats,logo,command);
+        factory_display_arm_repetitions(local_tstar,disciplined_tstar,duration,repeats,logo,start,command);
         try{DisplayTask(nullptr);}catch(const RunComplete&){}
         assert(started && frames.size()==seconds+1 && frames==expected);
         assert(actual_start-local_tstar==CONFIG_FACTORY_START_TASK_TEST_DELAY_US);
@@ -121,12 +121,12 @@ int main() {
         auto final=countdown.Update(host_now_us,rtc_discipline_local_to_disciplined_us(host_now_us));
         assert(final.state==factory_timer::TimerState::Finished && final.remaining_seconds==0);
         assert(s_frame_not_ready_count.load()==0 && host_inventory_calls==1);
-        std::cout<<"PASS: actual display "<<duration<<" s x "<<repeats<<" logo="<<logo<<" frames="<<frames.size()
+        std::cout<<"PASS: actual display "<<duration<<" s x "<<repeats<<" logo="<<logo<<" start="<<start<<" frames="<<frames.size()
                  <<" START task delay="<<actual_start-local_tstar<<" us; no internal zero frame or extra second\n";
     }
 }
 
 namespace factory_output {
 bool Init(){return true;} bool Ready(){return true;}
-void Schedule(int64_t,uint32_t,uint32_t,uint32_t){} void Cancel(){}
+void Schedule(int64_t,uint32_t,uint32_t,uint32_t,uint32_t){} void Cancel(){}
 }

@@ -2248,9 +2248,9 @@ void CommandTask(void *) {
                                 countdown.SetScheduledRunningMicroseconds(target_disciplined_us);
                                 ArmStartTimerLocked(armed_local_us);
 #if defined(CONFIG_FACTORY_DISPLAY_TEST) && CONFIG_FACTORY_DISPLAY_TEST
-                                factory_display_arm_program(armed_local_us, target_disciplined_us,
+                                factory_display_arm_repetitions(armed_local_us, target_disciplined_us,
                                                     processing.snapshot.duration_seconds,
-                                                    processing.snapshot.repeat_count, command.logo_seconds, command.command_id);
+                                                    processing.snapshot.repeat_count, command.logo_seconds, command.repeat_start_seconds, command.command_id);
 #endif
                             } else if (command.type == factory_timer::CommandType::Reset) {
                                 last_start_health = {};

@@ -30,6 +30,9 @@ void factory_display_arm_segment(int64_t local_start_us, int64_t start_disciplin
 bool factory_display_output_ready(void);
 void factory_display_arm_program(int64_t local_start_us, int64_t start_disciplined_us,
     uint32_t duration_seconds, uint32_t repeat_count, uint32_t logo_seconds, uint64_t command_id);
+void factory_display_arm_repetitions(int64_t local_start_us, int64_t start_disciplined_us,
+    uint32_t duration_seconds, uint32_t repeat_count, uint32_t logo_seconds,
+    uint32_t repeat_start_seconds, uint64_t command_id);
 void factory_display_arm(int64_t local_start_us, int64_t start_disciplined_us,
                          uint32_t duration_seconds, uint64_t command_id);
 

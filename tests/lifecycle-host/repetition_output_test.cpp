@@ -52,5 +52,30 @@ int main(){
     fail_arm=false;factory_output::Schedule(149200000,5,1,4);
     Fire(140200000);assert(high && deadline==146200000);
     fail_arm=true;Fire(146200000);assert(high && !armed); // blink re-arm failure returns OFF
+    fail_arm=false;host_now_us=200000000;edges.clear();
+    factory_output::Schedule(213000000,20,3,4,4); // local T*=205s
+    assert(!high && deadline==204000000);
+    Fire(204000000);assert(high && deadline==225000000);
+    for(int repetition=0;repetition<3;repetition++){
+        const int64_t begin=225000000+int64_t(repetition)*28000000;
+        for(int half=0;half<8;half++){
+            Fire(begin+int64_t(half)*500000);
+            assert(high==(half%2!=0));
+            assert(deadline==begin+int64_t(half+1)*500000);
+        }
+        Fire(begin+4000000);
+        if(repetition<2){
+            assert(!high && deadline==begin+8000000);
+            Fire(begin+5750000);assert(!high && deadline==begin+8000000); // steady, not another blink
+            Fire(begin+7999999);assert(!high && deadline==begin+8000000);
+            Fire(begin+8000000);assert(high && deadline==begin+28000000);
+        }else assert(high && !armed); // no start signal after the last repetition
+    }
+    assert(edges.size()==30);
+    host_now_us=300000000;factory_output::Schedule(313000000,20,3,4,4);
+    Fire(329000000);assert(!high && deadline==333000000);
+    factory_output::Cancel();assert(high && !armed);
+    Fire(333000000);assert(high && !armed);
+    std::cout<<"REPETITION_START_OUTPUT=PASS steady=4000000us blink_then_steady=1 countdown_off=1 final_has_no_extra_start=1 cancel_high=1\n";
     std::cout<<"GPIO33_OUTPUT=PASS active_low=1 boot_high=1 intro=4000000us blink=500000us four_cycles_each repetition_gap=4s cancel_high=1 legacy_high=1 absolute_phase=1 fail_high=1\n";
 }

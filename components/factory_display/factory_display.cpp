@@ -95,6 +95,7 @@ struct DisplayCommand {
     uint64_t command_id{};
     uint32_t repeat_count{1};
     uint32_t logo_seconds{};
+    uint32_t repeat_start_seconds{};
 };
 
 struct BoundaryTraceRecord {
@@ -1369,8 +1370,8 @@ void DisplayTask(void*) {
 #endif
 
 #if CONFIG_IDF_TARGET_ESP32
-        for (uint32_t elapsed = 1; elapsed <= factory_timer::SegmentSeconds(command.duration_seconds, command.repeat_count, command.logo_seconds); ++elapsed) {
-            const uint32_t remaining = factory_timer::RepeatRemaining(command.duration_seconds, command.repeat_count, elapsed, command.logo_seconds);
+        for (uint32_t elapsed = 1; elapsed <= factory_timer::SegmentSeconds(command.duration_seconds, command.repeat_count, command.logo_seconds, command.repeat_start_seconds); ++elapsed) {
+            const uint32_t remaining = factory_timer::RepeatRemaining(command.duration_seconds, command.repeat_count, elapsed, command.logo_seconds, command.repeat_start_seconds);
             if (remaining == 0) {
                 if (command.logo_seconds != 0) RenderIdleToBackBuffer();
                 else RenderFinishedToBackBuffer();
@@ -1452,8 +1453,8 @@ void DisplayTask(void*) {
             s_prepared_sequence.store(0, std::memory_order_release);
         }
 #else
-        for (uint32_t elapsed = 1; elapsed <= factory_timer::SegmentSeconds(command.duration_seconds, command.repeat_count, command.logo_seconds); ++elapsed) {
-            const uint32_t remaining = factory_timer::RepeatRemaining(command.duration_seconds, command.repeat_count, elapsed, command.logo_seconds);
+        for (uint32_t elapsed = 1; elapsed <= factory_timer::SegmentSeconds(command.duration_seconds, command.repeat_count, command.logo_seconds, command.repeat_start_seconds); ++elapsed) {
+            const uint32_t remaining = factory_timer::RepeatRemaining(command.duration_seconds, command.repeat_count, elapsed, command.logo_seconds, command.repeat_start_seconds);
             if (remaining == 0) {
                 if (command.logo_seconds != 0) RenderIdleToBackBuffer();
                 else RenderFinishedToBackBuffer();
@@ -1697,11 +1698,19 @@ extern "C" bool factory_display_output_ready(void) { return factory_output::Read
 
 extern "C" void factory_display_arm_program(int64_t local_start_us, int64_t start_disciplined_us,
     uint32_t duration_seconds, uint32_t repeat_count, uint32_t logo_seconds, uint64_t command_id) {
+    factory_display_arm_repetitions(local_start_us, start_disciplined_us, duration_seconds, repeat_count,
+                                    logo_seconds, 0, command_id);
+}
+
+extern "C" void factory_display_arm_repetitions(int64_t local_start_us, int64_t start_disciplined_us,
+    uint32_t duration_seconds, uint32_t repeat_count, uint32_t logo_seconds,
+    uint32_t repeat_start_seconds, uint64_t command_id) {
     if (!s_ready.load() || s_command_queue == nullptr || repeat_count == 0) return;
-    factory_output::Schedule(start_disciplined_us, duration_seconds, repeat_count, logo_seconds);
+    factory_output::Schedule(start_disciplined_us, duration_seconds, repeat_count, logo_seconds, repeat_start_seconds);
     DisplayCommand command{};
     command.repeat_count = repeat_count;
     command.logo_seconds = logo_seconds;
+    command.repeat_start_seconds = repeat_start_seconds;
     command.type = DisplayCommand::Type::Arm;
     command.local_start_us = local_start_us;
     command.start_disciplined_us = start_disciplined_us;

@@ -22,7 +22,7 @@ SemaphoreHandle_t mutex{};
 esp_timer_handle_t timer{};
 bool ready{}, active{};
 int64_t intro_end{}, epoch{};
-uint32_t duration{}, repeats{}, logo{};
+uint32_t duration{}, repeats{}, logo{}, repeat_start{};
 
 void WriteOutput(bool on) {
     gpio_set_level(kPin, on ? kActiveLevel : kInactiveLevel);
@@ -43,16 +43,20 @@ void UpdateLocked() {
     } else {
         const int64_t disciplined_now = rtc_discipline_local_to_disciplined_us(local_now);
         const int64_t elapsed = disciplined_now - epoch;
-        const int64_t cycle = (static_cast<int64_t>(duration) + logo) * 1000000;
-        if (elapsed >= cycle * repeats) {
+        const int64_t cycle = (static_cast<int64_t>(duration) + logo + repeat_start) * 1000000;
+        if (elapsed >= static_cast<int64_t>(factory_timer::SegmentSeconds(duration, repeats, logo, repeat_start)) * 1000000) {
             active = false;
             WriteOutput(false);
             return;
         }
         const int64_t index = elapsed < 0 ? 0 : elapsed / cycle;
         const int64_t logo_begin = epoch + index * cycle + static_cast<int64_t>(duration) * 1000000;
+        const int64_t start_begin = logo_begin + static_cast<int64_t>(logo) * 1000000;
         int64_t next_disciplined = logo_begin;
-        if (disciplined_now >= logo_begin) {
+        if (repeat_start != 0 && disciplined_now >= start_begin) {
+            on = true;
+            next_disciplined = epoch + (index + 1) * cycle;
+        } else if (disciplined_now >= logo_begin) {
             const int64_t half = (disciplined_now - logo_begin) / kHalfSecond;
             on = (half % 2) == 0;
             next_disciplined = logo_begin + (half + 1) * kHalfSecond;
@@ -99,12 +103,13 @@ bool Init() {
 
 bool Ready() { return ready; }
 
-void Schedule(int64_t start_disciplined_us, uint32_t seconds, uint32_t count, uint32_t logo_seconds) {
+void Schedule(int64_t start_disciplined_us, uint32_t seconds, uint32_t count, uint32_t logo_seconds, uint32_t repeat_start_seconds) {
     if (!ready) return;
     xSemaphoreTake(mutex, portMAX_DELAY);
-    active = logo_seconds == factory_timer::kRepetitionLogoSeconds && seconds > 0 && count > 0;
+    active = logo_seconds == factory_timer::kRepetitionLogoSeconds && seconds > 0 && count > 0 &&
+        (repeat_start_seconds == 0 || repeat_start_seconds == factory_timer::kRepetitionLogoSeconds);
     epoch = start_disciplined_us;
-    duration = seconds; repeats = count; logo = logo_seconds;
+    duration = seconds; repeats = count; logo = logo_seconds; repeat_start = repeat_start_seconds;
     intro_end = esp_timer_get_time() + 4000000;
     UpdateLocked();
     xSemaphoreGive(mutex);
